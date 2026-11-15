@@ -604,7 +604,15 @@ mod tests {
   #[test]
   fn ffprobe_next_to_ffmpeg() {
     assert_eq!(ffprobe_path("ffmpeg"), "ffprobe");
-    assert_eq!(ffprobe_path("/opt/ffmpeg/bin/ffmpeg"), "/opt/ffmpeg/bin/ffprobe");
+    // Joined with the system's separator, a backslash on Windows.
+    let expected = Path::new("/opt/ffmpeg/bin").join("ffprobe");
+    assert_eq!(ffprobe_path("/opt/ffmpeg/bin/ffmpeg"), expected.to_string_lossy());
+    let expected = Path::new("tools").join("ffprobe.exe");
+    assert_eq!(
+      ffprobe_path(&Path::new("tools").join("ffmpeg.exe").to_string_lossy()),
+      expected.to_string_lossy()
+    );
+    assert_eq!(ffprobe_path("ffmpeg.exe"), "ffprobe");
     assert_eq!(ffprobe_path("custom"), "ffprobe");
   }
 

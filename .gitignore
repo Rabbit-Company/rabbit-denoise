@@ -1,0 +1,9 @@
+/target
+/media
+/work
+/tools
+/results
+/scripts/denoisers.local.sh
+*.log
+__pycache__/
+/.cargo

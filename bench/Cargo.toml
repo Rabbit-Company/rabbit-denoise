@@ -1,0 +1,15 @@
+[package]
+name = "rdbench"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Scores denoised video against a reference, and the removed grain against the true grain"
+
+[dependencies]
+anyhow = "1"
+rayon = "1"
+serde_json = "1"
+ssimulacra2 = "0.5.1"
+v_frame = "0.3"
+y4m = "0.8"

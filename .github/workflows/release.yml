@@ -1,0 +1,105 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Linux builds link glibc, not musl: wgpu loads the system's Vulkan driver at run
+        # time, which a static musl binary cannot. Ubuntu 22.04 keeps them running on
+        # older distributions.
+        include:
+          - {
+              name: linux-x86_64-v2,
+              os: ubuntu-22.04,
+              target: x86_64-unknown-linux-gnu,
+              cpu: x86-64-v2,
+            }
+          - {
+              name: linux-x86_64-v3,
+              os: ubuntu-22.04,
+              target: x86_64-unknown-linux-gnu,
+              cpu: x86-64-v3,
+            }
+          - {
+              name: linux-x86_64-v4,
+              os: ubuntu-22.04,
+              target: x86_64-unknown-linux-gnu,
+              cpu: x86-64-v4,
+            }
+          - {
+              name: linux-aarch64,
+              os: ubuntu-22.04-arm,
+              target: aarch64-unknown-linux-gnu,
+              cpu: "",
+            }
+          - {
+              name: macos-x86_64,
+              os: macos-latest,
+              target: x86_64-apple-darwin,
+              cpu: "",
+            }
+          - {
+              name: macos-aarch64,
+              os: macos-latest,
+              target: aarch64-apple-darwin,
+              cpu: "",
+            }
+          - {
+              name: windows-x86_64,
+              os: windows-latest,
+              target: x86_64-pc-windows-msvc,
+              cpu: "",
+            }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build
+        shell: bash
+        run: |
+          if [ -n "${{ matrix.cpu }}" ]; then export RUSTFLAGS="-C target-cpu=${{ matrix.cpu }}"; fi
+          cargo build --release --locked -p rabbit-denoise --target ${{ matrix.target }}
+      - name: Package
+        shell: bash
+        run: |
+          binary=rabbit-denoise
+          if [[ "${{ matrix.target }}" == *windows* ]]; then binary=rabbit-denoise.exe; fi
+          archive=rabbit-denoise-${GITHUB_REF_NAME}-${{ matrix.name }}
+          mkdir "$archive"
+          cp "target/${{ matrix.target }}/release/$binary" README.md CHANGELOG.md LICENSE "$archive/"
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            7z a "$archive.zip" "$archive" > /dev/null
+            echo "ASSET=$archive.zip" >> "$GITHUB_ENV"
+          else
+            tar -czf "$archive.tar.gz" "$archive"
+            echo "ASSET=$archive.tar.gz" >> "$GITHUB_ENV"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ env.ASSET }}
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+      - name: Checksums
+        run: cd assets && sha256sum * > SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: assets/*

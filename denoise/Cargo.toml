@@ -1,0 +1,21 @@
+[package]
+name = "rabbit-denoise"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Remove film grain from video and keep the picture"
+
+[dependencies]
+anyhow = "1.0.104"
+bytemuck = { version = "1.25.2", features = ["derive"] }
+clap = { version = "4.6.7", features = ["derive"] }
+clap_complete = "4.6.11"
+clap_mangen = "0.3.3"
+ctrlc = { version = "3.5.2", features = ["termination"] }
+pollster = "1.0.1"
+rayon = "1"
+serde_json = "1"
+wgpu = "30.0.2"
+y4m = "0.8"

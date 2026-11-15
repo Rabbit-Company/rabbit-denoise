@@ -237,11 +237,6 @@ The filter runs on the GPU through wgpu, on Vulkan, Metal or DX12. It finds the 
 - `--timing` prints where the time went, with GPU timestamps per entry point and stage.
 - `MESA_SHADER_CACHE_DISABLE=true RADV_DEBUG=shaderstats` prints every shader's registers, workgroup memory and waves on RADV.
 
-## Plan
-
-1. An engine in RabbitEncoder.
-2. Better chroma on the `film-ducks` grain.
-
 ## Benchmark
 
 ```sh

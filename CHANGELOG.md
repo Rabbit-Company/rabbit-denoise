@@ -2,6 +2,13 @@
 
 Error codes and JSON field names stay compatible within a major version. Messages meant for people may change in any release. Before 1.0, a minor version may change the defaults and the options.
 
+## 0.1.1 - 2026-11-15
+
+### Changes
+
+- About twice as fast on GPUs with much more compute than float atomic throughput, from 8.8 to 17.5 fps at 1080p on a Radeon RX 9060 XT. `filter_groups` adds up the patches of each 4x4 block of references in workgroup memory, so each pixel goes to the accumulators once. Adding every patch with float atomics took 75 per cent of the time there.
+- The grain between frames and in the residuals is measured on all planes at once, and chroma scales the luma basic estimates once for each size.
+
 ## 0.1.0 - 2026-11-15
 
 First release: a denoiser for the regrain workflow.
@@ -24,6 +31,5 @@ First release: a denoiser for the regrain workflow.
 ### Known limitations
 
 - Two GPU runs of the same video differ by about 100 dB, far below anything visible, as the GPU adds up overlapping patches in a different order each time.
-
 - 10 bit greyscale y4m is not read. Video files in 10 bit greyscale are converted to 12 bit by ffmpeg.
 - y4m output carries no colour primaries or transfer. Write `.mkv` to keep them.

@@ -211,8 +211,11 @@ impl Gpu {
       bail!("only a software GPU ({}) was found", info.name);
     }
     let available = adapter.limits();
-    // find_groups keeps two regions and its lanes' positions in workgroup memory.
-    let workgroup_memory = (2 * MAX_TILE_SIDE * MAX_TILE_SIDE * 4 + 512 * 4 + 2 * 16 * 4 + 16) as u32;
+    // find_groups keeps two regions and its lanes' positions in workgroup memory, and
+    // filter_groups the sums of a region and one patch's DCT.
+    let find_memory = 2 * MAX_TILE_SIDE * MAX_TILE_SIDE * 4 + 512 * 4 + 2 * 16 * 4 + 16;
+    let filter_memory = 2 * MAX_TILE_SIDE * MAX_TILE_SIDE * 4 + (3 * 64 + 2 * 17) * 4 + 16;
+    let workgroup_memory = find_memory.max(filter_memory) as u32;
     if available.max_compute_workgroup_storage_size < workgroup_memory {
       bail!("{} has too little workgroup memory for the GPU filter", info.name);
     }
@@ -876,7 +879,7 @@ impl Gpu {
     }
     let passes: [(&wgpu::ComputePipeline, u32); 3] = [
       (&pipelines.find_groups, tiles as u32),
-      (&pipelines.filter, refs as u32),
+      (&pipelines.filter, tiles as u32),
       (&pipelines.normalize, (plane_size as u32).div_ceil(WORKGROUP)),
     ];
     for (i, (pipeline, workgroups)) in passes.into_iter().enumerate() {

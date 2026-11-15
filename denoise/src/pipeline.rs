@@ -9,6 +9,7 @@ use crate::noise::{NoiseModel, NoiseStats};
 use crate::plane::Frame;
 use crate::plane::Plane;
 use anyhow::Result;
+use rayon::prelude::*;
 use std::collections::BTreeMap;
 
 /// Both stages remove grain best at this multiple of the measured grain deviation, the
@@ -527,7 +528,7 @@ impl Denoiser {
     let residual = self.noisy[&index]
       .frame
       .planes
-      .iter()
+      .par_iter()
       .zip(&self.basic[&index].planes)
       .map(|(n, b)| NoiseStats::measure_residual(n, b, self.maxval, &self.transforms))
       .collect();
@@ -547,21 +548,32 @@ impl Denoiser {
       return;
     };
     let start = std::time::Instant::now();
-    // Chroma is matched on the luma basic estimates at its size.
-    let luma_matching: Vec<Option<(Plane, Plane)>> = (0..b.frame.planes.len())
-      .map(|p| {
-        let (w, h) = (b.frame.planes[p].width, b.frame.planes[p].height);
-        (p > 0 && self.settings.chroma_luma_matching).then(|| (a_basic.planes[0].downscale(w, h), b_basic.planes[0].downscale(w, h)))
-      })
+    // Chroma is matched on the luma basic estimates at its size, scaled once for each size.
+    let planes = b.frame.planes.len();
+    let size = |p: usize| (b.frame.planes[p].width, b.frame.planes[p].height);
+    let mut sizes: Vec<(usize, usize)> = (1..planes).map(size).collect();
+    sizes.dedup();
+    if !self.settings.chroma_luma_matching {
+      sizes.clear();
+    }
+    let scaled: Vec<(Plane, Plane)> = sizes
+      .par_iter()
+      .map(|&(w, h)| rayon::join(|| a_basic.planes[0].downscale(w, h), || b_basic.planes[0].downscale(w, h)))
       .collect();
-    let temporal = (0..b.frame.planes.len())
+    // The planes are measured at once, as each alone leaves threads idle.
+    let temporal = (0..planes)
+      .into_par_iter()
       .map(|p| {
+        let matching = sizes
+          .iter()
+          .position(|&s| p > 0 && s == size(p))
+          .map(|i| (&scaled[i].0, &scaled[i].1));
         NoiseStats::measure_temporal(
           &a.frame.planes[p],
           &a_basic.planes[p],
           &b.frame.planes[p],
           &b_basic.planes[p],
-          luma_matching[p].as_ref().map(|(x, y)| (x, y)),
+          matching,
           self.maxval,
           &self.transforms,
         )

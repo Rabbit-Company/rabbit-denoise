@@ -29,8 +29,8 @@ A build that is too new for the CPU crashes with an illegal instruction error an
 On Linux and macOS:
 
 ```sh
-tar -xzf rabbit-denoise-v0.1.0-linux-x86_64-v3.tar.gz
-sudo install rabbit-denoise-v0.1.0-linux-x86_64-v3/rabbit-denoise /usr/local/bin/
+tar -xzf rabbit-denoise-v0.1.1-linux-x86_64-v3.tar.gz
+sudo install rabbit-denoise-v0.1.1-linux-x86_64-v3/rabbit-denoise /usr/local/bin/
 ```
 
 The macOS binaries are not signed. If macOS refuses to open it, clear the quarantine flag once:
@@ -227,7 +227,7 @@ What sets it apart is how it measures the grain:
 The filter runs on the GPU through wgpu, on Vulkan, Metal or DX12. It finds the same groups as the CPU version, and the outputs are about 70 dB apart. Two GPU runs of the same video also differ, by about 100 dB, as the GPU adds up overlapping patches in a different order each time. The difference is far below anything visible, but the output is not the same byte for byte. `cargo test` checks that whenever a GPU opens. On the Radeon 780M it denoises 1080p at about 9.2 fps over a 30 second clip, against about 0.4 fps on 16 CPU threads.
 
 - `find_groups` gives each 4x4 block of reference patches one workgroup, with the searched region in workgroup memory and four threads per patch.
-- `filter_groups` gives each group 64 threads, one per coefficient.
+- `filter_groups` gives each 4x4 block of reference patches one workgroup, which filters their groups in turn with one thread per coefficient. The patches are added up in workgroup memory, and each pixel goes to the accumulators once. Adding every patch with float atomics took 75 per cent of the time on a Radeon RX 9060 XT.
 - `half_plane` and `motion` measure the motion fields on luma, and chroma follows them.
 - Frames, the planes averaged 2x2 and the motion fields stay on the GPU, so each is made once.
 - A first stage is queued behind the second stage in flight and the next second stage behind it, so the GPU always has work. The CPU measures grain meanwhile, and threads read and write frames. The GPU waits about 8 per cent of the time.

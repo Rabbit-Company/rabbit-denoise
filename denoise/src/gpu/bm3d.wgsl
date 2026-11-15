@@ -2,8 +2,9 @@
 //
 // - find_groups: 64 threads take 4x4 reference patches, 4 threads each, searching a region
 //   held in workgroup memory.
-// - filter_groups: 64 threads per group, one per coefficient, filter it and add the current
-//   frame's patches into the accumulators.
+// - filter_groups: 64 threads take the groups of 4x4 reference patches in turn, one thread
+//   per coefficient, and add the current frame's patches into a region in workgroup memory,
+//   which then goes into the accumulators.
 // - normalize: one thread per pixel divides the sums.
 
 const N: u32 = 8u;
@@ -1038,13 +1039,18 @@ fn motion(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index)
 
 // ---- filter_groups ----
 
-// One patch on its way through the 8x8 DCT, and the filtered current frame members.
+// One patch on its way through the 8x8 DCT.
 var<workgroup> tile: array<f32, 64>;
 var<workgroup> rows: array<f32, 64>;
-var<workgroup> current: array<f32, 576>;
 var<workgroup> reduce: array<f32, 64>;
 var<workgroup> members: array<u32, 16>;
 var<workgroup> member_count: u32;
+// Where the current frame members are in the group.
+var<workgroup> kept: array<u32, 16>;
+var<workgroup> kept_count: u32;
+// Numerators, then denominators, of the region the tile's current frame members cover.
+// Each pixel goes to the accumulators once, as atomics cost most of the time on some GPUs.
+var<workgroup> sums: array<f32, 2u * TILE_SIDE * TILE_SIDE>;
 
 // Coefficient t of the 8x8 DCT of the patch whose pixel t is `value`. Every thread calls it.
 fn dct(t: u32, value: f32) -> f32 {
@@ -1066,6 +1072,26 @@ fn dct(t: u32, value: f32) -> f32 {
   return out;
 }
 
+// Pixel t of the patch whose coefficient t is `value`. Every thread calls it.
+fn inverse_dct(t: u32, value: f32) -> f32 {
+  let row = t / N;
+  let col = t % N;
+  workgroupBarrier();
+  tile[t] = value;
+  workgroupBarrier();
+  var s = 0.0;
+  for (var u = 0u; u < N; u++) {
+    s += tables[DCT + u * N + col] * tile[row * N + u];
+  }
+  rows[t] = s;
+  workgroupBarrier();
+  var out = 0.0;
+  for (var v = 0u; v < N; v++) {
+    out += tables[DCT + v * N + row] * rows[v * N + col];
+  }
+  return out;
+}
+
 fn sum_over_threads(t: u32, value: f32) -> f32 {
   workgroupBarrier();
   reduce[t] = value;
@@ -1079,16 +1105,62 @@ fn sum_over_threads(t: u32, value: f32) -> f32 {
   return reduce[0];
 }
 
+// One workgroup per 4x4 block of references, as in find_groups.
 @compute @workgroup_size(64)
 fn filter_groups(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) t: u32) {
-  let r = wg.y * params.dispatch_x + wg.x;
-  if (r >= params.refs_x * params.refs_y) {
+  let tiles_x = (params.refs_x + TILE_REFS - 1u) / TILE_REFS;
+  let tiles_y = (params.refs_y + TILE_REFS - 1u) / TILE_REFS;
+  let tile = wg.y * params.dispatch_x + wg.x;
+  if (tile >= tiles_x * tiles_y) {
     return;
   }
+  let i0 = (tile % tiles_x) * TILE_REFS;
+  let j0 = (tile / tiles_x) * TILE_REFS;
+  let i1 = min(i0 + TILE_REFS, params.refs_x) - 1u;
+  let j1 = min(j0 + TILE_REFS, params.refs_y) - 1u;
+  // The region the current frame members can reach, as find_groups searches it.
+  if (t == 0u) {
+    let r = params.search_radius;
+    let first_x = u32(tables[POSITIONS + i0]);
+    let last_x = u32(tables[POSITIONS + i1]);
+    let first_y = u32(tables[POSITIONS + params.refs_x + j0]);
+    let last_y = u32(tables[POSITIONS + params.refs_x + j1]);
+    let x0 = select(0u, first_x - r, first_x >= r);
+    let y0 = select(0u, first_y - r, first_y >= r);
+    let x1 = min(last_x + r + N, params.width);
+    let y1 = min(last_y + r + N, params.height);
+    region = vec4<u32>(x0, y0, x1 - x0, y1 - y0);
+  }
+  workgroupBarrier();
+  let area = region.z * region.w;
+  for (var i = t; i < area; i += 64u) {
+    sums[i] = 0.0;
+    sums[TILE_SIDE * TILE_SIDE + i] = 0.0;
+  }
+  for (var j = j0; j <= j1; j++) {
+    for (var i = i0; i <= i1; i++) {
+      filter_group(j * params.refs_x + i, t);
+    }
+  }
+  workgroupBarrier();
+  for (var i = t; i < area; i += 64u) {
+    let weight = sums[TILE_SIDE * TILE_SIDE + i];
+    if (weight > 0.0) {
+      let pixel = (region.y + i / region.z) * params.width + region.x + i % region.z;
+      atomic_add(pixel, sums[i]);
+      atomic_add(params.plane_size + pixel, weight);
+    }
+  }
+}
+
+// Filters group r and adds its current frame members into sums. Every thread calls it.
+fn filter_group(r: u32, t: u32) {
   let row = t / N;
   let col = t % N;
   let c = params.center;
   let wiener = params.stage == 1u;
+  // The last group may still be reading the members.
+  workgroupBarrier();
   if (t == 0u) {
     member_count = groups[r * GROUP_STRIDE];
   }
@@ -1162,42 +1234,42 @@ fn filter_groups(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation
       }
     }
   }
-  // Back along the group, keeping only the members in the current frame.
-  var kept = 0u;
-  for (var m = 0u; m < n; m++) {
-    if (unpack_frame(members[m]) != c) {
-      continue;
+  // Only the members in the current frame go back.
+  if (t == 0u) {
+    var count = 0u;
+    for (var m = 0u; m < n; m++) {
+      if (unpack_frame(members[m]) == c) {
+        kept[count] = m;
+        count++;
+      }
     }
-    var s = 0.0;
-    for (var k = 0u; k < n; k++) {
-      s += tables[basis + k * n + m] * spectrum[k];
-    }
-    current[kept * AREA + t] = s;
-    kept++;
+    kept_count = count;
   }
   let total = sum_over_threads(t, left);
   let weight = select(1.0, 1.0 / total, total > 0.0);
 
-  // Inverse 2D DCT of each, as pixel (row, col), added into the picture.
+  // Back along the group and through the inverse 2D DCT, as pixel (row, col), added into
+  // the region. The inverse DCT's barriers keep overlapping patches apart.
   let w = weight * tables[KAISER + t];
-  kept = 0u;
-  for (var m = 0u; m < n; m++) {
+  let count = workgroupUniformLoad(&kept_count);
+  for (var j = 0u; j < count; j++) {
+    let m = kept[j];
+    var coefficient = 0.0;
+    for (var k = 0u; k < n; k++) {
+      coefficient += tables[basis + k * n + m] * spectrum[k];
+    }
+    let s = inverse_dct(t, coefficient);
     let p = members[m];
-    if (unpack_frame(p) != c) {
-      continue;
+    let x = unpack_x(p) + col;
+    let y = unpack_y(p) + row;
+    if (x >= region.x && y >= region.y && x < region.x + region.z && y < region.y + region.w) {
+      let at = (y - region.y) * region.z + x - region.x;
+      sums[at] += w * s;
+      sums[TILE_SIDE * TILE_SIDE + at] += w;
+    } else {
+      atomic_add(y * params.width + x, w * s);
+      atomic_add(params.plane_size + y * params.width + x, w);
     }
-    var s = 0.0;
-    for (var v = 0u; v < N; v++) {
-      var q = 0.0;
-      for (var u = 0u; u < N; u++) {
-        q += tables[DCT + u * N + col] * current[kept * AREA + v * N + u];
-      }
-      s += tables[DCT + v * N + row] * q;
-    }
-    kept++;
-    let pixel = (unpack_y(p) + row) * params.width + unpack_x(p) + col;
-    atomic_add(pixel, w * s);
-    atomic_add(params.plane_size + pixel, w);
   }
 }
 

@@ -340,8 +340,9 @@ impl Denoiser {
         let (models, temporal) = self.hard_models(n, n.saturating_sub(hard_radius), n);
         let basic = self.submit_basic(n, &models)?;
         self.finish_in_flight(&mut out)?;
-        // Not while a frame waits to be redone, which could change its window.
-        if self.bootstrapped.is_empty() && self.final_ready() {
+        // Also while a frame waits to be redone. The second stage reads what it would have
+        // read when the last frame was done, and grainless video leaves frames waiting for good.
+        if self.final_ready() {
           let index = self.next_final;
           self.in_flight = Some((index, self.submit_final(index)?));
         }
@@ -360,10 +361,8 @@ impl Denoiser {
         self.finish_in_flight(&mut out)?;
         progressed = true;
       }
-      // At the end of the stream there is no first stage left to queue behind, and while a
-      // frame waits to be redone the queued path is closed. Frames must not pile up then.
-      let waiting = !self.bootstrapped.is_empty();
-      if !progressed && (self.ended || waiting) && self.in_flight.is_none() && self.final_ready() {
+      // At the end of the stream there is no first stage left to queue behind.
+      if !progressed && self.ended && self.in_flight.is_none() && self.final_ready() {
         let index = self.next_final;
         let submitted = self.submit_final(index)?;
         let frame = self.finish_final(submitted)?;

@@ -200,10 +200,10 @@ impl NoiseStats {
               let mut sum = 0.0;
               for row in 0..N {
                 let candidate = match_b.row(mx, my + row, N);
-                for i in 0..N {
-                  let d = reference[row * N + i] - candidate[i];
-                  sum += d * d;
-                }
+                let d: [f32; N] = std::array::from_fn(|i| reference[row * N + i] - candidate[i]);
+                // Added in pairs four apart, so that the compiler can use vectors.
+                sum +=
+                  ((d[0] * d[0] + d[4] * d[4]) + (d[1] * d[1] + d[5] * d[5])) + ((d[2] * d[2] + d[6] * d[6]) + (d[3] * d[3] + d[7] * d[7]));
                 if sum >= best {
                   break;
                 }

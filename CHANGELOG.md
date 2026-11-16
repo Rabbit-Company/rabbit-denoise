@@ -2,6 +2,13 @@
 
 Error codes and JSON field names stay compatible within a major version. Messages meant for people may change in any release. Before 1.0, a minor version may change the defaults and the options.
 
+## 0.1.2 - 2026-11-16
+
+### Changes
+
+- About twice as fast on video with little or no grain, from 7.0 to 14.6 fps at 1080p on a Radeon RX 9060 XT with an i7-8700K. Such video measures no grain between frames, so its frames waited to be redone and the GPU and CPU took turns. The second stage is now queued behind the first stage then too, and the output is the same.
+- The block search that measures grain between frames is about 40 per cent faster on the CPU.
+
 ## 0.1.1 - 2026-11-15
 
 ### Changes

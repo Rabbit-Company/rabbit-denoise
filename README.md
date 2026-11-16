@@ -29,8 +29,8 @@ A build that is too new for the CPU crashes with an illegal instruction error an
 On Linux and macOS:
 
 ```sh
-tar -xzf rabbit-denoise-v0.1.5-linux-x86_64-v3.tar.gz
-sudo install rabbit-denoise-v0.1.5-linux-x86_64-v3/rabbit-denoise /usr/local/bin/
+tar -xzf rabbit-denoise-v0.1.6-linux-x86_64-v3.tar.gz
+sudo install rabbit-denoise-v0.1.6-linux-x86_64-v3/rabbit-denoise /usr/local/bin/
 ```
 
 The macOS binaries are not signed. If macOS refuses to open it, clear the quarantine flag once:
@@ -227,7 +227,7 @@ What sets it apart is how it measures the grain:
 The filter runs on the GPU through wgpu, on Vulkan, Metal or DX12. It finds the same groups as the CPU version, and the outputs are about 70 dB apart. Two GPU runs of the same video also differ, by about 100 dB, as the GPU adds up overlapping patches in a different order each time. The difference is far below anything visible, but the output is not the same byte for byte. `cargo test` checks that whenever a GPU opens. On the Radeon 780M it denoises 1080p at about 9.2 fps over a 30 second clip, against about 0.4 fps on 16 CPU threads.
 
 - `find_groups` gives each 4x4 block of reference patches one workgroup, with the searched region in workgroup memory and four threads per patch.
-- `filter_groups` gives each 4x4 block of reference patches one workgroup, which filters their groups in turn with one thread per coefficient. The patches are added up in workgroup memory, and each pixel goes to the accumulators once. Adding every patch with float atomics took 75 per cent of the time on a Radeon RX 9060 XT.
+- `filter_groups` gives each 4x4 block of reference patches one workgroup, which filters their groups in turn with one thread per coefficient. The patches within 2 pixels of the references are added up in workgroup memory, and each of those pixels goes to the accumulators once. Adding every patch with float atomics took 75 per cent of the time on a Radeon RX 9060 XT. Summing the whole searched region instead held the GPU to fewer workgroups at once and was 9 per cent slower. DCTs in f16 were slower, as converting to and from f32 cost more than the registers they saved.
 - `half_plane` and `motion` measure the motion fields on luma, and chroma follows them.
 - Each entry point runs for all three planes in one pass, and only the motion fields' entry points may write the fields, so the planes run at the same time.
 - Frames, the planes averaged 2x2 and the motion fields stay on the GPU, so each is made once.

@@ -19,6 +19,9 @@ const FAR: f32 = 3.0e38;
 // gpu/mod.rs sets the region side for the step and search radius.
 const TILE_REFS: u32 = 4u;
 const LANES: u32 = 4u;
+// How far past its references filter_groups sums in workgroup memory. Members further out
+// go to the accumulators. A smaller region lets more workgroups run at once.
+const FILTER_MARGIN: u32 = 2u;
 //#TILE_SIDE
 // Offsets into the tables buffer: Kaiser window, 8x8 DCT basis, then the group DCT basis
 // of length n at GROUP_BASIS + n * 256, then the reference positions.
@@ -1051,9 +1054,9 @@ var<workgroup> member_count: u32;
 // Where the current frame members are in the group.
 var<workgroup> kept: array<u32, 16>;
 var<workgroup> kept_count: u32;
-// Numerators, then denominators, of the region the tile's current frame members cover.
+// Numerators, then denominators, of the region around the tile's references.
 // Each pixel goes to the accumulators once, as atomics cost most of the time on some GPUs.
-var<workgroup> sums: array<f32, 2u * TILE_SIDE * TILE_SIDE>;
+var<workgroup> sums: array<f32, 2u * FILTER_SIDE * FILTER_SIDE>;
 
 // The DCT basis values thread t's row and column need, loaded once by load_basis: forward,
 // then inverse.
@@ -1139,9 +1142,9 @@ fn filter_groups(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation
   let j0 = (tile / tiles_x) * TILE_REFS;
   let i1 = min(i0 + TILE_REFS, params.refs_x) - 1u;
   let j1 = min(j0 + TILE_REFS, params.refs_y) - 1u;
-  // The region the current frame members can reach, as find_groups searches it.
+  // The references' patches and FILTER_MARGIN around them, where most current frame members are.
   if (t == 0u) {
-    let r = params.search_radius;
+    let r = min(params.search_radius, FILTER_MARGIN);
     let first_x = u32(tables[POSITIONS + i0]);
     let last_x = u32(tables[POSITIONS + i1]);
     let first_y = u32(tables[POSITIONS + params.refs_x + j0]);
@@ -1157,7 +1160,7 @@ fn filter_groups(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation
   let area = region.z * region.w;
   for (var i = t; i < area; i += 64u) {
     sums[i] = 0.0;
-    sums[TILE_SIDE * TILE_SIDE + i] = 0.0;
+    sums[FILTER_SIDE * FILTER_SIDE + i] = 0.0;
   }
   for (var j = j0; j <= j1; j++) {
     for (var i = i0; i <= i1; i++) {
@@ -1166,7 +1169,7 @@ fn filter_groups(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation
   }
   workgroupBarrier();
   for (var i = t; i < area; i += 64u) {
-    let weight = sums[TILE_SIDE * TILE_SIDE + i];
+    let weight = sums[FILTER_SIDE * FILTER_SIDE + i];
     if (weight > 0.0) {
       let pixel = (region.y + i / region.z) * params.width + region.x + i % region.z;
       atomic_add(pixel, sums[i]);
@@ -1287,7 +1290,7 @@ fn filter_group(r: u32, t: u32) {
     if (x >= region.x && y >= region.y && x < region.x + region.z && y < region.y + region.w) {
       let at = (y - region.y) * region.z + x - region.x;
       sums[at] += w * s;
-      sums[TILE_SIDE * TILE_SIDE + at] += w;
+      sums[FILTER_SIDE * FILTER_SIDE + at] += w;
     } else {
       atomic_add(y * params.width + x, w * s);
       atomic_add(params.plane_size + y * params.width + x, w);

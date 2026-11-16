@@ -30,6 +30,8 @@ const MAX_JOBS: usize = 3;
 const STAMPS: u32 = 8;
 // The largest region side find_groups searches.
 const MAX_TILE_SIDE: usize = 40;
+// How far past its references filter_groups sums in workgroup memory, as in bm3d.wgsl.
+const FILTER_MARGIN: usize = 2;
 
 /// The accumulator with float atomics.
 const FLOAT_ACCUMULATOR: &str = "
@@ -167,8 +169,8 @@ pub struct Gpu {
   /// Of the filter's entry points, then of the motion fields' ones.
   pipeline_layouts: [wgpu::PipelineLayout; 2],
   float_atomics: bool,
-  /// Built on first use for each region side.
-  pipelines: RefCell<HashMap<usize, std::rc::Rc<Pipelines>>>,
+  /// Built on first use for each pair of region sides.
+  pipelines: RefCell<HashMap<(usize, usize), std::rc::Rc<Pipelines>>>,
   /// Kaiser window, 8x8 DCT and the group DCT of every length.
   tables: Vec<f32>,
   name: String,
@@ -379,9 +381,10 @@ impl Gpu {
       .map(|t| t.totals.borrow().map(|stage| stage.map(|ns| ns / 1e9)))
   }
 
-  /// The entry points for a region side, built the first time it is asked for.
-  fn pipelines(&self, side: usize) -> Result<std::rc::Rc<Pipelines>> {
-    if let Some(p) = self.pipelines.borrow().get(&side) {
+  /// The entry points for the sides of the regions find_groups and filter_groups keep, built
+  /// the first time they are asked for.
+  fn pipelines(&self, side: usize, filter_side: usize) -> Result<std::rc::Rc<Pipelines>> {
+    if let Some(p) = self.pipelines.borrow().get(&(side, filter_side)) {
       return Ok(p.clone());
     }
     // Shader and pipeline errors come back as errors instead of ending the program.
@@ -398,7 +401,7 @@ impl Gpu {
             "//#TILE_SIDE",
             // The other tile also holds the 16 references' 4 lanes' 8 best distances.
             &format!(
-              "const TILE_SIDE: u32 = {side}u;\nconst OTHER_AREA: u32 = {}u;",
+              "const TILE_SIDE: u32 = {side}u;\nconst OTHER_AREA: u32 = {}u;\nconst FILTER_SIDE: u32 = {filter_side}u;",
               (side * side).max(512)
             ),
           )
@@ -438,7 +441,7 @@ impl Gpu {
     if let Some(error) = pollster::block_on(scope.pop()) {
       bail!("the GPU could not build the filter: {error}");
     }
-    self.pipelines.borrow_mut().insert(side, built.clone());
+    self.pipelines.borrow_mut().insert((side, filter_side), built.clone());
     Ok(built)
   }
 
@@ -827,7 +830,8 @@ impl Gpu {
     // The region 4x4 reference patches search.
     let side = (TILE_REFS - 1) * params.step + N + 2 * params.search_radius;
     debug_assert!(side <= MAX_TILE_SIDE);
-    let pipelines = self.pipelines(side)?;
+    let filter_side = (TILE_REFS - 1) * params.step + N + 2 * FILTER_MARGIN.min(params.search_radius);
+    let pipelines = self.pipelines(side, filter_side)?;
     let xs = crate::bm3d::positions(width, params.step);
     let ys = crate::bm3d::positions(height, params.step);
     let refs = xs.len() * ys.len();

@@ -85,6 +85,9 @@ struct Params {
 @group(0) @binding(7) var<storage, read_write> groups: array<u32>;
 // Every block's move per slot, as (dx + 512) | (dy + 512) << 16 in luma samples.
 @group(0) @binding(8) var<storage, read_write> fields: array<u32>;
+// The same fields for find_groups, which only reads them. Planes that share no buffer they
+// write run at the same time.
+@group(0) @binding(10) var<storage, read> fields_in: array<u32>;
 // Luma planes averaged 2x2, one per guide slot.
 @group(0) @binding(9) var<storage, read_write> half_planes: array<f32>;
 
@@ -888,7 +891,7 @@ fn search_moved(lane: u32, frame: u32, cx: u32, cy: u32, field: u32, limit: f32)
   let bx = min((cx * params.motion_scale_x + 4u) / 16u, params.field_blocks_x - 1u);
   let by = min((cy * params.motion_scale_y + 4u) / 16u, params.field_blocks_y - 1u);
   let slot = u32(tables[params.field_map + field]);
-  let packed = fields[slot * blocks + by * params.field_blocks_x + bx];
+  let packed = fields_in[slot * blocks + by * params.field_blocks_x + bx];
   let dx = (i32(packed & 0xffffu) - 512) / i32(params.motion_scale_x);
   let dy = (i32(packed >> 16u) - 512) / i32(params.motion_scale_y);
   let px = u32(clamp(i32(cx) + dx, 0, i32(params.width - N)));

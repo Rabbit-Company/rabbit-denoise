@@ -2,6 +2,13 @@
 
 Error codes and JSON field names stay compatible within a major version. Messages meant for people may change in any release. Before 1.0, a minor version may change the defaults and the options.
 
+## 0.1.5 - 2026-11-16
+
+### Changes
+
+- 1 to 2 per cent faster on the GPU. Each entry point runs for all three planes in one pass, and `find_groups` only reads the motion fields, so the planes run at the same time instead of one after another.
+- The GPU filter needs 8 storage buffers per shader stage instead of 9.
+
 ## 0.1.4 - 2026-11-16
 
 ### Changes

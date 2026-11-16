@@ -29,8 +29,8 @@ A build that is too new for the CPU crashes with an illegal instruction error an
 On Linux and macOS:
 
 ```sh
-tar -xzf rabbit-denoise-v0.1.4-linux-x86_64-v3.tar.gz
-sudo install rabbit-denoise-v0.1.4-linux-x86_64-v3/rabbit-denoise /usr/local/bin/
+tar -xzf rabbit-denoise-v0.1.5-linux-x86_64-v3.tar.gz
+sudo install rabbit-denoise-v0.1.5-linux-x86_64-v3/rabbit-denoise /usr/local/bin/
 ```
 
 The macOS binaries are not signed. If macOS refuses to open it, clear the quarantine flag once:
@@ -229,6 +229,7 @@ The filter runs on the GPU through wgpu, on Vulkan, Metal or DX12. It finds the 
 - `find_groups` gives each 4x4 block of reference patches one workgroup, with the searched region in workgroup memory and four threads per patch.
 - `filter_groups` gives each 4x4 block of reference patches one workgroup, which filters their groups in turn with one thread per coefficient. The patches are added up in workgroup memory, and each pixel goes to the accumulators once. Adding every patch with float atomics took 75 per cent of the time on a Radeon RX 9060 XT.
 - `half_plane` and `motion` measure the motion fields on luma, and chroma follows them.
+- Each entry point runs for all three planes in one pass, and only the motion fields' entry points may write the fields, so the planes run at the same time.
 - Frames, the planes averaged 2x2 and the motion fields stay on the GPU, so each is made once.
 - `pair_blocks` and `residual_blocks` find the blocks the grain is measured on between frames and in what the first stage removed, in the same submission as the first stage. Its result goes into the ring on the GPU, and the CPU only takes the medians of the blocks. They match the CPU's blocks to within 0.1 per cent.
 - A first stage is queued behind the second stage in flight and the next second stage behind it, so the GPU always has work. The CPU takes the medians meanwhile and measures single frames, and threads read and write frames.

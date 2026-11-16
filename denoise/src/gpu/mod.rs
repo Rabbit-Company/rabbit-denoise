@@ -26,7 +26,7 @@ const WORKGROUP: u32 = 64;
 const MAX_FRAMES: usize = 63;
 // The most planes one submission holds.
 const MAX_JOBS: usize = 3;
-// Timestamps per plane: around the motion fields and each of the three filter passes.
+// Timestamps per submission: around the motion fields and each of the three filter passes.
 const STAMPS: u32 = 8;
 // The largest region side find_groups searches.
 const MAX_TILE_SIDE: usize = 40;
@@ -139,7 +139,7 @@ enum Kind {
 
 /// GPU time per entry point, from timestamps around each pass.
 struct Timing {
-  /// STAMPS for each of MAX_JOBS planes, of the hard threshold stage, then the Wiener stage.
+  /// STAMPS of the hard threshold stage, then of the Wiener stage.
   queries: wgpu::QuerySet,
   /// One of each for each stage, as one submission of each may be outstanding.
   resolved: [wgpu::Buffer; 2],
@@ -162,7 +162,10 @@ pub struct Gpu {
   device: wgpu::Device,
   queue: wgpu::Queue,
   layout: wgpu::BindGroupLayout,
-  pipeline_layout: wgpu::PipelineLayout,
+  /// For half_plane and motion, which write the motion fields.
+  motion_layout: wgpu::BindGroupLayout,
+  /// Of the filter's entry points, then of the motion fields' ones.
+  pipeline_layouts: [wgpu::PipelineLayout; 2],
   float_atomics: bool,
   /// Built on first use for each region side.
   pipelines: RefCell<HashMap<usize, std::rc::Rc<Pipelines>>>,
@@ -225,12 +228,12 @@ impl Gpu {
     if available.max_compute_workgroup_storage_size < workgroup_memory {
       bail!("{} has too little workgroup memory for the GPU filter", info.name);
     }
-    // Nine storage buffers.
-    if available.max_storage_buffers_per_shader_stage < 9 {
+    // Eight storage buffers.
+    if available.max_storage_buffers_per_shader_stage < 8 {
       bail!("{} has too few storage buffers for the GPU filter", info.name);
     }
     let limits = wgpu::Limits {
-      max_storage_buffers_per_shader_stage: 9,
+      max_storage_buffers_per_shader_stage: 8,
       max_compute_workgroup_storage_size: workgroup_memory
         .next_power_of_two()
         .min(available.max_compute_workgroup_storage_size),
@@ -265,19 +268,20 @@ impl Gpu {
       },
       count: None,
     };
+    let uniform = |binding: u32| wgpu::BindGroupLayoutEntry {
+      binding,
+      visibility: wgpu::ShaderStages::COMPUTE,
+      ty: wgpu::BindingType::Buffer {
+        ty: wgpu::BufferBindingType::Uniform,
+        has_dynamic_offset: false,
+        min_binding_size: None,
+      },
+      count: None,
+    };
     let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
       label: Some("bm3d"),
       entries: &[
-        wgpu::BindGroupLayoutEntry {
-          binding: 0,
-          visibility: wgpu::ShaderStages::COMPUTE,
-          ty: wgpu::BindingType::Buffer {
-            ty: wgpu::BufferBindingType::Uniform,
-            has_dynamic_offset: false,
-            min_binding_size: None,
-          },
-          count: None,
-        },
+        uniform(0),
         storage(1, true),
         storage(2, true),
         storage(3, true),
@@ -285,15 +289,22 @@ impl Gpu {
         storage(5, true),
         storage(6, false),
         storage(7, false),
-        storage(8, false),
-        storage(9, false),
+        storage(10, true),
       ],
     });
-    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-      label: Some("bm3d"),
-      bind_group_layouts: &[Some(&layout)],
-      immediate_size: 0,
+    // The motion fields' entry points write the fields and the planes averaged 2x2.
+    let motion_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+      label: Some("motion"),
+      entries: &[uniform(0), storage(2, true), storage(5, true), storage(8, false), storage(9, false)],
     });
+    let pipeline_layout = |layout: &wgpu::BindGroupLayout| {
+      device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("bm3d"),
+        bind_group_layouts: &[Some(layout)],
+        immediate_size: 0,
+      })
+    };
+    let pipeline_layouts = [pipeline_layout(&layout), pipeline_layout(&motion_layout)];
     // Kaiser window, 8x8 DCT, then the group DCT of every length at 128 + n * 256.
     let mut tables = crate::bm3d::kaiser().to_vec();
     tables.extend(basis(N));
@@ -306,12 +317,12 @@ impl Gpu {
       queries: device.create_query_set(&wgpu::QuerySetDescriptor {
         label: Some("timing"),
         ty: wgpu::QueryType::Timestamp,
-        count: 2 * STAMPS * MAX_JOBS as u32,
+        count: 2 * STAMPS,
       }),
       resolved: [(); 2].map(|_| {
         device.create_buffer(&wgpu::BufferDescriptor {
           label: Some("timing"),
-          size: 8 * STAMPS as u64 * MAX_JOBS as u64,
+          size: 8 * STAMPS as u64,
           usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
           mapped_at_creation: false,
         })
@@ -319,7 +330,7 @@ impl Gpu {
       readback: [(); 2].map(|_| {
         device.create_buffer(&wgpu::BufferDescriptor {
           label: Some("timing"),
-          size: 8 * STAMPS as u64 * MAX_JOBS as u64,
+          size: 8 * STAMPS as u64,
           usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
           mapped_at_creation: false,
         })
@@ -338,7 +349,8 @@ impl Gpu {
       device,
       queue,
       layout,
-      pipeline_layout,
+      motion_layout,
+      pipeline_layouts,
       float_atomics,
       pipelines: RefCell::new(HashMap::new()),
       motion: RefCell::new(HashMap::new()),
@@ -402,10 +414,10 @@ impl Gpu {
     // SAFETY: indices stay in range for every size `supports` and `filter` allow, and
     // every loop ends. Debug builds keep the checks.
     let module = unsafe { self.device.create_shader_module_trusted(source, checks) };
-    let pipeline = |entry: &str| {
+    let pipeline = |entry: &str, layout: usize| {
       self.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
         label: Some(entry),
-        layout: Some(&self.pipeline_layout),
+        layout: Some(&self.pipeline_layouts[layout]),
         module: &module,
         entry_point: Some(entry),
         // Every workgroup value is written before it is read.
@@ -417,11 +429,11 @@ impl Gpu {
       })
     };
     let built = std::rc::Rc::new(Pipelines {
-      half_plane: pipeline("half_plane"),
-      motion: pipeline("motion"),
-      find_groups: pipeline("find_groups"),
-      filter: pipeline("filter_groups"),
-      normalize: pipeline("normalize"),
+      half_plane: pipeline("half_plane", 1),
+      motion: pipeline("motion", 1),
+      find_groups: pipeline("find_groups", 0),
+      filter: pipeline("filter_groups", 0),
+      normalize: pipeline("normalize", 0),
     });
     if let Some(error) = pollster::block_on(scope.pop()) {
       bail!("the GPU could not build the filter: {error}");
@@ -542,19 +554,68 @@ impl Gpu {
     let scope = self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
     let mut encoder = self.device.create_command_encoder(&Default::default());
     let mut pending = Vec::with_capacity(jobs.len());
-    for (j, job) in jobs.iter().enumerate() {
-      pending.push(self.encode(&mut encoder, job, maxval, wiener as usize * MAX_JOBS + j)?);
+    let mut passes = Vec::with_capacity(jobs.len());
+    for job in jobs {
+      let (done, plane) = self.encode(&mut encoder, job, maxval)?;
+      pending.push(done);
+      passes.extend(plane);
+    }
+    // Each entry point runs for every plane in one pass, so that the planes overlap and the
+    // GPU waits for the last workgroups once per entry point instead of once per plane.
+    let first = STAMPS * wiener as u32;
+    let stamps = |i: u32| {
+      self.timing.as_ref().map(|t| wgpu::ComputePassTimestampWrites {
+        query_set: &t.queries,
+        beginning_of_pass_write_index: Some(first + 2 * i),
+        end_of_pass_write_index: Some(first + 2 * i + 1),
+      })
+    };
+    let motion = passes.iter().any(|p| p.motion.is_some());
+    if motion {
+      let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: None,
+        timestamp_writes: stamps(0),
+      });
+      for p in &passes {
+        if let Some((group, [half, fields])) = &p.motion {
+          pass.set_bind_group(0, group, &[]);
+          pass.set_pipeline(&p.pipelines.half_plane);
+          pass.dispatch_workgroups(half.0, half.1, 1);
+          pass.set_pipeline(&p.pipelines.motion);
+          pass.dispatch_workgroups(fields.0, fields.1, 1);
+        }
+      }
+    }
+    for i in 0..3 {
+      let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+        label: None,
+        timestamp_writes: stamps(1 + i as u32),
+      });
+      for p in &passes {
+        let pipeline = [&p.pipelines.find_groups, &p.pipelines.filter, &p.pipelines.normalize][i];
+        let (x, y) = p.dispatches[i];
+        pass.set_bind_group(0, &p.bind_group, &[]);
+        pass.set_pipeline(pipeline);
+        pass.dispatch_workgroups(x, y, 1);
+      }
+    }
+    {
+      let works = self.work.borrow();
+      for done in &pending {
+        if let Pending::Submitted { plane, .. } = done {
+          let work = &works[&(*plane, wiener)];
+          encoder.copy_buffer_to_buffer(&work.output, 0, &work.readback, 0, None);
+        }
+      }
     }
     let measured = match measure {
       Some(m) => Some(self.encode_measure_after(&mut encoder, jobs, &pending, m)?),
       None => None,
     };
     if let Some(t) = &self.timing {
-      let first = STAMPS * (wiener as usize * MAX_JOBS) as u32;
-      let count = STAMPS * jobs.len() as u32;
       let stage = wiener as usize;
-      encoder.resolve_query_set(&t.queries, first..first + count, &t.resolved[stage], 0);
-      encoder.copy_buffer_to_buffer(&t.resolved[stage], 0, &t.readback[stage], 0, Some(8 * count as u64));
+      encoder.resolve_query_set(&t.queries, first..first + STAMPS, &t.resolved[stage], 0);
+      encoder.copy_buffer_to_buffer(&t.resolved[stage], 0, &t.readback[stage], 0, None);
     }
     let index = self.queue.submit([encoder.finish()]);
     if let Some(error) = pollster::block_on(scope.pop()) {
@@ -566,6 +627,7 @@ impl Gpu {
       wiener,
       index,
       measured,
+      motion,
     })
   }
 
@@ -582,6 +644,7 @@ impl Gpu {
       wiener,
       index,
       measured,
+      motion,
     } = submission;
     let mut outstanding = self.outstanding.get();
     outstanding[wiener as usize] = false;
@@ -648,11 +711,9 @@ impl Gpu {
       drop(view);
       readback.unmap();
       let mut totals = t.totals.borrow_mut();
-      for j in 0..jobs {
-        for i in 0..4 {
-          let at = STAMPS as usize * j + 2 * i;
-          totals[wiener as usize][i] += stamps[at + 1].saturating_sub(stamps[at]) as f64 * t.period;
-        }
+      // Without motion fields to measure, their timestamps are not written.
+      for i in if motion { 0 } else { 1 }..4 {
+        totals[wiener as usize][i] += stamps[2 * i + 1].saturating_sub(stamps[2 * i]) as f64 * t.period;
       }
     }
     let measures = measured.map(|m| self.read_measure(&m)).transpose()?;
@@ -729,8 +790,8 @@ impl Gpu {
     slot
   }
 
-  /// Records one plane's work into the encoder.
-  fn encode(&self, encoder: &mut wgpu::CommandEncoder, job: &Job, maxval: f32, slot: usize) -> Result<Pending> {
+  /// Prepares one plane's work, for `record` to dispatch with the other planes'.
+  fn encode(&self, encoder: &mut wgpu::CommandEncoder, job: &Job, maxval: f32) -> Result<(Pending, Option<Passes>)> {
     let Job {
       stage,
       window,
@@ -740,7 +801,7 @@ impl Gpu {
     let current = window.noisy[window.center];
     let (width, height) = (current.width, current.height);
     if width < N || height < N {
-      return Ok(Pending::Done(current.clone()));
+      return Ok((Pending::Done(current.clone()), None));
     }
     let frames = window.noisy.len();
     if width >= 1 << 13 || height >= 1 << 13 || frames > MAX_FRAMES || window.center >= frames {
@@ -928,77 +989,67 @@ impl Gpu {
       Some(cache) if motion => (&cache.fields, &cache.half_planes),
       _ => (&self.empty, &self.empty),
     };
-    let entries: Vec<wgpu::BindGroupEntry> = [
-      &uniforms,
-      noisy,
-      guide,
-      &model,
-      &work.accum,
-      &tables,
-      &work.output,
-      &work.groups,
-      fields,
-      half_planes,
-    ]
-    .iter()
-    .enumerate()
-    .map(|(i, buffer)| wgpu::BindGroupEntry {
-      binding: i as u32,
-      resource: buffer.as_entire_binding(),
-    })
-    .collect();
-    let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-      label: Some("bm3d"),
-      layout: &self.layout,
-      entries: &entries,
+    let bind = |layout: &wgpu::BindGroupLayout, buffers: &[(u32, &wgpu::Buffer)]| {
+      let entries: Vec<wgpu::BindGroupEntry> = buffers
+        .iter()
+        .map(|&(binding, buffer)| wgpu::BindGroupEntry {
+          binding,
+          resource: buffer.as_entire_binding(),
+        })
+        .collect();
+      self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("bm3d"),
+        layout,
+        entries: &entries,
+      })
+    };
+    let bind_group = bind(
+      &self.layout,
+      &[
+        (0, &uniforms),
+        (1, noisy),
+        (2, guide),
+        (3, &model),
+        (4, &work.accum),
+        (5, &tables),
+        (6, &work.output),
+        (7, &work.groups),
+        (10, fields),
+      ],
+    );
+    let motion_group = (motion && window.plane == 0).then(|| {
+      bind(
+        &self.motion_layout,
+        &[(0, &uniforms), (2, guide), (5, &tables), (8, fields), (9, half_planes)],
+      )
     });
 
     let grid = |workgroups: u32| (workgroups.min(DISPATCH_X), workgroups.div_ceil(DISPATCH_X));
     encoder.clear_buffer(&work.accum, 0, None);
-    let tiles = xs.len().div_ceil(TILE_REFS) * ys.len().div_ceil(TILE_REFS);
-    if motion && window.plane == 0 {
-      let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: None,
-        timestamp_writes: self.timing.as_ref().map(|t| wgpu::ComputePassTimestampWrites {
-          query_set: &t.queries,
-          beginning_of_pass_write_index: Some(STAMPS * slot as u32),
-          end_of_pass_write_index: Some(STAMPS * slot as u32 + 1),
-        }),
-      });
-      pass.set_bind_group(0, &bind_group, &[]);
-      let (x, y) = grid(((half_jobs.len() * (width / 2) * (height / 2)) as u32).div_ceil(WORKGROUP));
-      pass.set_pipeline(&pipelines.half_plane);
-      pass.dispatch_workgroups(x, y, 1);
-      // One workgroup per block of each field to measure.
-      let (x, y) = grid((blocks_x * blocks_y * field_jobs.len()) as u32);
-      pass.set_pipeline(&pipelines.motion);
-      pass.dispatch_workgroups(x, y, 1);
-    }
-    let passes: [(&wgpu::ComputePipeline, u32); 3] = [
-      (&pipelines.find_groups, tiles as u32),
-      (&pipelines.filter, tiles as u32),
-      (&pipelines.normalize, (plane_size as u32).div_ceil(WORKGROUP)),
-    ];
-    for (i, (pipeline, workgroups)) in passes.into_iter().enumerate() {
-      let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-        label: None,
-        timestamp_writes: self.timing.as_ref().map(|t| wgpu::ComputePassTimestampWrites {
-          query_set: &t.queries,
-          beginning_of_pass_write_index: Some((STAMPS as usize * slot + 2 + 2 * i) as u32),
-          end_of_pass_write_index: Some((STAMPS as usize * slot + 3 + 2 * i) as u32),
-        }),
-      });
-      pass.set_bind_group(0, &bind_group, &[]);
-      let (x, y) = grid(workgroups);
-      pass.set_pipeline(pipeline);
-      pass.dispatch_workgroups(x, y, 1);
-    }
-    encoder.copy_buffer_to_buffer(&work.output, 0, &work.readback, 0, None);
-    Ok(Pending::Submitted {
-      plane: window.plane,
-      width,
-      height,
-    })
+    let tiles = (xs.len().div_ceil(TILE_REFS) * ys.len().div_ceil(TILE_REFS)) as u32;
+    let passes = Passes {
+      bind_group,
+      motion: motion_group.map(|group| {
+        (
+          group,
+          [
+            grid(((half_jobs.len() * (width / 2) * (height / 2)) as u32).div_ceil(WORKGROUP)),
+            // One workgroup per block of each field to measure.
+            grid((blocks_x * blocks_y * field_jobs.len()) as u32),
+          ],
+        )
+      }),
+      dispatches: [grid(tiles), grid(tiles), grid((plane_size as u32).div_ceil(WORKGROUP))],
+      pipelines,
+    };
+    Ok((
+      Pending::Submitted {
+        plane: window.plane,
+        width,
+        height,
+      },
+      Some(passes),
+    ))
   }
 }
 
@@ -1011,6 +1062,19 @@ pub struct Submission {
   index: wgpu::SubmissionIndex,
   /// The grain measured on the result, if asked for.
   measured: Option<measure::PendingMeasure>,
+  /// Whether it measured motion fields.
+  motion: bool,
+}
+
+/// A plane's bind group and dispatches, which `Gpu::record` runs with the other planes'.
+struct Passes {
+  bind_group: wgpu::BindGroup,
+  pipelines: std::rc::Rc<Pipelines>,
+  /// The bind group and dispatches of half_plane and motion, on the luma plane when it
+  /// measures motion fields.
+  motion: Option<(wgpu::BindGroup, [(u32, u32); 2])>,
+  /// find_groups, filter_groups and normalize.
+  dispatches: [(u32, u32); 3],
 }
 
 /// What `Gpu::submit` measures on the hard threshold stage's result: the residual of the

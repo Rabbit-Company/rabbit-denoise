@@ -5,12 +5,15 @@
 
 use crate::bm3d::{FrameKey, Params, Stage, TOP_K, Window};
 use crate::dct::{AREA, N, basis};
-use crate::noise::{BANDS, NoiseModel};
+use crate::noise::{BANDS, Measures, NoiseModel};
 use crate::plane::Plane;
 use anyhow::{Context, Result, bail};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use wgpu::util::DeviceExt;
+
+mod measure;
+pub use measure::MeasureFrame;
 
 const MAX_GROUP: usize = 16;
 // Per reference in the groups buffer: the count, then up to MAX_GROUP matches.
@@ -178,6 +181,9 @@ pub struct Gpu {
   empty: wgpu::Buffer,
   /// Whether a submission of each stage is still outstanding.
   outstanding: std::cell::Cell<[bool; 2]>,
+  /// The grain measurement's entry points, built on first use, and each plane's buffers.
+  measuring: RefCell<Option<measure::Measuring>>,
+  measure_work: RefCell<HashMap<usize, measure::MeasureWork>>,
 }
 
 /// Whether the GPU filter can run these parameters. The shader runs without bounds checks
@@ -339,6 +345,8 @@ impl Gpu {
       field_use: RefCell::new(FieldUse::default()),
       empty,
       outstanding: std::cell::Cell::new([false; 2]),
+      measuring: RefCell::new(None),
+      measure_work: RefCell::new(HashMap::new()),
       tables,
       name: format!("{} ({:?})", info.name, info.backend),
       rings: RefCell::new(HashMap::new()),
@@ -499,13 +507,14 @@ impl Gpu {
 
   /// Filters several planes of one stage in one submission.
   pub fn filter_planes(&self, jobs: &[Job], maxval: f32) -> Result<Vec<Plane>> {
-    let submission = self.submit(jobs, maxval)?;
+    let submission = self.submit(jobs, maxval, None)?;
     self.collect(submission)
   }
 
   /// Starts filtering several planes of one stage and returns at once. One submission of
-  /// each stage may be outstanding.
-  pub fn submit(&self, jobs: &[Job], maxval: f32) -> Result<Submission> {
+  /// each stage may be outstanding. With `measure`, the grain of the hard threshold stage's
+  /// result is measured in the same submission, for `collect_measured`.
+  pub fn submit(&self, jobs: &[Job], maxval: f32, measure: Option<&MeasureAfter>) -> Result<Submission> {
     let wiener = jobs.first().is_some_and(|j| j.stage == Stage::Wiener);
     if jobs.iter().any(|j| (j.stage == Stage::Wiener) != wiener) {
       bail!("one submission holds planes of one stage");
@@ -514,7 +523,10 @@ impl Gpu {
     if outstanding[wiener as usize] {
       bail!("a GPU submission of this stage is still outstanding");
     }
-    let result = self.record(jobs, maxval, wiener);
+    if wiener && measure.is_some() {
+      bail!("only the hard threshold stage's result is measured");
+    }
+    let result = self.record(jobs, maxval, wiener, measure);
     if result.is_ok() {
       outstanding[wiener as usize] = true;
       self.outstanding.set(outstanding);
@@ -522,7 +534,7 @@ impl Gpu {
     result
   }
 
-  fn record(&self, jobs: &[Job], maxval: f32, wiener: bool) -> Result<Submission> {
+  fn record(&self, jobs: &[Job], maxval: f32, wiener: bool, measure: Option<&MeasureAfter>) -> Result<Submission> {
     if jobs.len() > MAX_JOBS {
       bail!("at most {MAX_JOBS} planes go to the GPU at once");
     }
@@ -533,6 +545,10 @@ impl Gpu {
     for (j, job) in jobs.iter().enumerate() {
       pending.push(self.encode(&mut encoder, job, maxval, wiener as usize * MAX_JOBS + j)?);
     }
+    let measured = match measure {
+      Some(m) => Some(self.encode_measure_after(&mut encoder, jobs, &pending, m)?),
+      None => None,
+    };
     if let Some(t) = &self.timing {
       let first = STAMPS * (wiener as usize * MAX_JOBS) as u32;
       let count = STAMPS * jobs.len() as u32;
@@ -549,16 +565,23 @@ impl Gpu {
       jobs: jobs.len(),
       wiener,
       index,
+      measured,
     })
   }
 
   /// Waits for a submission and reads its planes back.
   pub fn collect(&self, submission: Submission) -> Result<Vec<Plane>> {
+    Ok(self.collect_measured(submission)?.0)
+  }
+
+  /// Waits for a submission and reads its planes back, and the grain measured on them.
+  pub fn collect_measured(&self, submission: Submission) -> Result<(Vec<Plane>, Option<Measures>)> {
     let Submission {
       pending,
       jobs,
       wiener,
       index,
+      measured,
     } = submission;
     let mut outstanding = self.outstanding.get();
     outstanding[wiener as usize] = false;
@@ -577,6 +600,9 @@ impl Gpu {
           });
         mapped += 1;
       }
+    }
+    if let Some(m) = &measured {
+      mapped += self.map_measure(m, &sender);
     }
     if let Some(t) = &self.timing {
       t.readback[wiener as usize].slice(..).map_async(wgpu::MapMode::Read, |_| {});
@@ -629,7 +655,78 @@ impl Gpu {
         }
       }
     }
-    Ok(out)
+    let measures = measured.map(|m| self.read_measure(&m)).transpose()?;
+    Ok((out, measures))
+  }
+
+  /// Records the measurement of the hard threshold stage's result. The result goes into the
+  /// basic ring on the GPU, where the Wiener stage finds it.
+  fn encode_measure_after(
+    &self,
+    encoder: &mut wgpu::CommandEncoder,
+    jobs: &[Job],
+    pending: &[Pending],
+    m: &MeasureAfter,
+  ) -> Result<measure::PendingMeasure> {
+    let mut planes = Vec::with_capacity(jobs.len());
+    for (job, done) in jobs.iter().zip(pending) {
+      let p = job.window.plane;
+      let noisy = &m.noisy[p];
+      let size = noisy.width * noisy.height;
+      let basic = match done {
+        Pending::Submitted { .. } => {
+          let slot = self.reserve(Kind::Basic, p, size, m.key, m.slots[1]);
+          let rings = self.rings.borrow();
+          let works = self.work.borrow();
+          encoder.copy_buffer_to_buffer(
+            &works[&(p, false)].output,
+            0,
+            &rings[&(p, Kind::Basic)].buffer,
+            (slot * size * 4) as u64,
+            Some((size * 4) as u64),
+          );
+          slot
+        }
+        // Too small to filter, so the result is the noisy plane.
+        Pending::Done(plane) => self.slot_of(Kind::Basic, p, plane, m.key, m.slots[1]),
+      };
+      let noisy_key = FrameKey {
+        index: m.key.index,
+        version: 0,
+      };
+      let previous = m.previous.as_ref().map(|f| {
+        [
+          self.slot_of(Kind::Noisy, p, &f.noisy[p], f.noisy_key, m.slots[0]),
+          self.slot_of(Kind::Basic, p, &f.basic[p], f.basic_key, m.slots[1]),
+        ]
+      });
+      planes.push(measure::MeasurePlane {
+        width: noisy.width,
+        height: noisy.height,
+        current: [self.slot_of(Kind::Noisy, p, noisy, noisy_key, m.slots[0]), basic],
+        previous,
+      });
+    }
+    self.encode_measure(encoder, &planes, true, m.luma_matching)
+  }
+
+  /// A slot for a frame's plane that the GPU fills itself. A ring that does not exist yet
+  /// gets `slots` slots.
+  fn reserve(&self, kind: Kind, plane: usize, size: usize, key: FrameKey, slots: usize) -> usize {
+    let mut rings = self.rings.borrow_mut();
+    let ring = rings.entry((plane, kind)).or_insert_with(|| Ring {
+      buffer: self.buffer("ring", 0, wgpu::BufferUsages::STORAGE),
+      plane_size: 0,
+      keys: Vec::new(),
+    });
+    if ring.plane_size != size {
+      ring.buffer = self.buffer("ring", slots * size * 4, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST);
+      ring.plane_size = size;
+      ring.keys = vec![None; slots];
+    }
+    let slot = key.index % ring.keys.len();
+    ring.keys[slot] = Some(key);
+    slot
   }
 
   /// Records one plane's work into the encoder.
@@ -912,6 +1009,23 @@ pub struct Submission {
   /// Whether its planes are in the Wiener stage.
   wiener: bool,
   index: wgpu::SubmissionIndex,
+  /// The grain measured on the result, if asked for.
+  measured: Option<measure::PendingMeasure>,
+}
+
+/// What `Gpu::submit` measures on the hard threshold stage's result: the residual of the
+/// frame, and the pair it ends.
+pub struct MeasureAfter<'a> {
+  /// The frame's index and the version its new basic estimate gets.
+  pub key: FrameKey,
+  /// The frame's noisy planes.
+  pub noisy: &'a [Plane],
+  /// The frame before, done already.
+  pub previous: Option<MeasureFrame<'a>>,
+  /// Whether chroma is matched on the luma basic estimates.
+  pub luma_matching: bool,
+  /// The slots of rings made here, noisy then basic.
+  pub slots: [usize; 2],
 }
 
 /// One plane to filter.

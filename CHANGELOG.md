@@ -2,6 +2,14 @@
 
 Error codes and JSON field names stay compatible within a major version. Messages meant for people may change in any release. Before 1.0, a minor version may change the defaults and the options.
 
+## 0.1.3 - 2026-11-16
+
+### Changes
+
+- The grain between frames and in what the first stage removed is measured on the GPU, in the same submission as the first stage. Only the medians are left to the CPU, so a slow CPU no longer holds the GPU back. At 1080p on a Radeon RX 9060 XT with an i7-8700K, the x86-64-v2 build goes from 10.6 to 19.1 fps on video without grain, and grainy video from about 18 to 20 fps. The GPU finds the same blocks as the CPU, to within 0.1 per cent.
+- The first stage's result goes into the GPU's ring of frames on the GPU, so the second stage no longer uploads it.
+- Without a GPU, what the first stage removed is measured on all threads.
+
 ## 0.1.2 - 2026-11-16
 
 ### Changes

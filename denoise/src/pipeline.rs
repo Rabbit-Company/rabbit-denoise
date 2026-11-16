@@ -5,7 +5,7 @@
 use crate::bm3d::{self, FrameKey, Params, Stage, Window};
 use crate::dct::Transforms;
 use crate::gpu::{self, Gpu};
-use crate::noise::{NoiseModel, NoiseStats};
+use crate::noise::{Measures, NoiseModel, NoiseStats};
 use crate::plane::Frame;
 use crate::plane::Plane;
 use anyhow::Result;
@@ -202,8 +202,16 @@ impl Denoiser {
     self.gpu_note.as_deref()
   }
 
-  /// Starts filtering every plane of a frame for one stage. The CPU filters at once.
-  fn submit_planes(&self, stage: Stage, windows: &[Window], models: &[NoiseModel], params: &Params) -> Result<Submitted> {
+  /// Starts filtering every plane of a frame for one stage. The CPU filters at once. With
+  /// `measure`, the GPU also measures the grain of the hard threshold stage's result.
+  fn submit_planes(
+    &self,
+    stage: Stage,
+    windows: &[Window],
+    models: &[NoiseModel],
+    params: &Params,
+    measure: Option<&gpu::MeasureAfter>,
+  ) -> Result<Submitted> {
     let start = std::time::Instant::now();
     let out = match &self.gpu {
       Some(gpu) => {
@@ -217,7 +225,7 @@ impl Denoiser {
             params,
           })
           .collect();
-        gpu.submit(&jobs, self.maxval).map(Submitted::Gpu)
+        gpu.submit(&jobs, self.maxval, measure).map(Submitted::Gpu)
       }
       None => Ok(Submitted::Done(
         windows
@@ -231,11 +239,16 @@ impl Denoiser {
     out
   }
 
-  fn collect(&self, submitted: Submitted) -> Result<Vec<Plane>> {
+  /// The planes, and on the GPU the grain measured on them if it was asked for.
+  fn collect(&self, submitted: Submitted) -> Result<(Vec<Plane>, Option<Measures>)> {
     let start = std::time::Instant::now();
     let out = match submitted {
-      Submitted::Gpu(submission) => self.gpu.as_ref().expect("a GPU submission without a GPU").collect(submission),
-      Submitted::Done(planes) => Ok(planes),
+      Submitted::Gpu(submission) => self
+        .gpu
+        .as_ref()
+        .expect("a GPU submission without a GPU")
+        .collect_measured(submission),
+      Submitted::Done(planes) => Ok((planes, None)),
     };
     self.add_seconds(3, start);
     out
@@ -338,22 +351,23 @@ impl Denoiser {
         let n = self.next_basic;
         // Only pairs before this frame are measured yet.
         let (models, temporal) = self.hard_models(n, n.saturating_sub(hard_radius), n);
-        let basic = self.submit_basic(n, &models)?;
+        // The GPU measures the grain of the result in the same submission.
+        let basic = self.submit_basic(n, &models, true)?;
         self.finish_in_flight(&mut out)?;
-        // Also while a frame waits to be redone. The second stage reads what it would have
-        // read when the last frame was done, and grainless video leaves frames waiting for good.
+        // Also while a frame waits to be redone, as grainless video leaves frames waiting for
+        // good. It reads what it would have read when the last frame was done, and frames done
+        // again are uploaded behind it.
         if self.final_ready() {
           let index = self.next_final;
           self.in_flight = Some((index, self.submit_final(index)?));
         }
-        self.finish_basic(n, models, basic)?;
+        let measured = self.finish_basic(n, models, basic)?;
         self.next_basic += 1;
-        self.measure_residual(n);
-        self.measure_pair(n);
-        // Frames done again change basic estimates the second stage may read.
-        if !temporal || !self.bootstrapped.is_empty() || self.noisy[&n].temporal.as_ref().is_some_and(|t| t[0].is_empty()) {
-          self.finish_in_flight(&mut out)?;
-        }
+        let blocks = match measured {
+          Some(measures) => measures,
+          None => self.measure_blocks(n, true, true)?,
+        };
+        self.keep_measures(n, blocks);
         self.redo_after(n, temporal)?;
         progressed = true;
       }
@@ -485,22 +499,25 @@ impl Denoiser {
 
   /// Runs stage 1 on a frame with these models and keeps the result.
   fn run_basic(&mut self, index: usize, models: Vec<NoiseModel>) -> Result<()> {
-    let submitted = self.submit_basic(index, &models)?;
-    self.finish_basic(index, models, submitted)
+    let submitted = self.submit_basic(index, &models, false)?;
+    self.finish_basic(index, models, submitted)?;
+    Ok(())
   }
 
-  /// Keeps a frame's stage 1 result once it is done.
-  fn finish_basic(&mut self, index: usize, models: Vec<NoiseModel>, submitted: Submitted) -> Result<()> {
-    let planes = self.collect(submitted)?;
+  /// Keeps a frame's stage 1 result once it is done, and returns the grain the GPU measured
+  /// on it.
+  fn finish_basic(&mut self, index: usize, models: Vec<NoiseModel>, submitted: Submitted) -> Result<Option<Measures>> {
+    let (planes, measured) = self.collect(submitted)?;
     self.models.insert(index, models);
     self.basic.insert(index, Frame { planes });
     // A redone basic estimate is a new version, so the GPU uploads it again.
     *self.basic_versions.entry(index).or_insert(0) += 1;
-    Ok(())
+    Ok(measured)
   }
 
-  /// Starts stage 1 on a frame with these models.
-  fn submit_basic(&self, index: usize, models: &[NoiseModel]) -> Result<Submitted> {
+  /// Starts stage 1 on a frame with these models. With `measure`, the GPU also measures the
+  /// grain of the result, of its residual and of the pair it ends.
+  fn submit_basic(&self, index: usize, models: &[NoiseModel], measure: bool) -> Result<Submitted> {
     let radius = self.settings.hard.temporal_radius;
     let (first, last) = self.span(index, radius, self.read);
     let windows: Vec<Window> = (0..models.len())
@@ -518,68 +535,138 @@ impl Denoiser {
         }
       })
       .collect();
-    self.submit_planes(Stage::Hard, &windows, models, &self.settings.hard)
-  }
-
-  /// Measures the grain in what a frame's basic estimate removed.
-  fn measure_residual(&mut self, index: usize) {
-    let start = std::time::Instant::now();
-    let residual = self.noisy[&index]
-      .frame
-      .planes
-      .par_iter()
-      .zip(&self.basic[&index].planes)
-      .map(|(n, b)| NoiseStats::measure_residual(n, b, self.maxval, &self.transforms))
-      .collect();
-    self.add_seconds(1, start);
-    self.noisy.get_mut(&index).unwrap().residual = Some(residual);
-  }
-
-  /// Measures the grain between a frame and the one before it.
-  fn measure_pair(&mut self, index: usize) {
-    let Some(previous) = index.checked_sub(1) else { return };
-    let (Some(a), Some(a_basic), Some(b), Some(b_basic)) = (
-      self.noisy.get(&previous),
-      self.basic.get(&previous),
-      self.noisy.get(&index),
-      self.basic.get(&index),
-    ) else {
-      return;
+    let previous = index
+      .checked_sub(1)
+      .filter(|i| self.basic.contains_key(i))
+      .map(|i| gpu::MeasureFrame {
+        noisy: &self.noisy[&i].frame.planes,
+        basic: &self.basic[&i].planes,
+        noisy_key: FrameKey { index: i, version: 0 },
+        basic_key: FrameKey {
+          index: i,
+          version: self.basic_versions[&i],
+        },
+      });
+    let after = gpu::MeasureAfter {
+      key: FrameKey {
+        index,
+        version: self.basic_versions.get(&index).map_or(1, |v| v + 1),
+      },
+      noisy: &self.noisy[&index].frame.planes,
+      previous,
+      luma_matching: self.settings.chroma_luma_matching,
+      slots: self.ring_slots(),
     };
+    self.submit_planes(Stage::Hard, &windows, models, &self.settings.hard, measure.then_some(&after))
+  }
+
+  /// The slots of the GPU's rings, noisy then basic, as the filter makes them.
+  fn ring_slots(&self) -> [usize; 2] {
+    [&self.settings.hard, &self.settings.wiener].map(|p| 4 * p.temporal_radius + 4)
+  }
+
+  /// Measures the grain in what a frame's basic estimate removed, with `residual`, and
+  /// between it and the frame before, with `pair`.
+  fn measure(&mut self, index: usize, residual: bool, pair: bool) -> Result<()> {
+    let blocks = self.measure_blocks(index, residual, pair)?;
+    self.keep_measures(index, blocks);
+    Ok(())
+  }
+
+  /// The blocks the measurements take the medians of, on the GPU when there is one. A pair
+  /// whose frames are not both done is left out.
+  fn measure_blocks(&self, index: usize, residual: bool, pair: bool) -> Result<Measures> {
     let start = std::time::Instant::now();
-    // Chroma is matched on the luma basic estimates at its size, scaled once for each size.
-    let planes = b.frame.planes.len();
-    let size = |p: usize| (b.frame.planes[p].width, b.frame.planes[p].height);
-    let mut sizes: Vec<(usize, usize)> = (1..planes).map(size).collect();
-    sizes.dedup();
-    if !self.settings.chroma_luma_matching {
-      sizes.clear();
+    let previous = index
+      .checked_sub(1)
+      .filter(|&i| pair && self.noisy.contains_key(&i) && self.basic.contains_key(&i));
+    let (b, b_basic) = (&self.noisy[&index].frame, &self.basic[&index]);
+    let (luma_matching, transforms) = (self.settings.chroma_luma_matching, &*self.transforms);
+    let blocks = match &self.gpu {
+      Some(gpu) => {
+        let frame = |i: usize| gpu::MeasureFrame {
+          noisy: &self.noisy[&i].frame.planes,
+          basic: &self.basic[&i].planes,
+          noisy_key: FrameKey { index: i, version: 0 },
+          basic_key: FrameKey {
+            index: i,
+            version: self.basic_versions[&i],
+          },
+        };
+        gpu.measure(
+          &frame(index),
+          previous.map(frame).as_ref(),
+          residual,
+          luma_matching,
+          self.ring_slots(),
+        )?
+      }
+      None => Measures {
+        residual: residual.then(|| {
+          b.planes
+            .par_iter()
+            .zip(&b_basic.planes)
+            .map(|(n, basic)| NoiseStats::residual_blocks(n, basic, transforms))
+            .collect()
+        }),
+        pairs: previous.map(|previous| {
+          let (a, a_basic) = (&self.noisy[&previous].frame, &self.basic[&previous]);
+          // Chroma is matched on the luma basic estimates at its size, scaled once for each size.
+          let planes = b.planes.len();
+          let size = |p: usize| (b.planes[p].width, b.planes[p].height);
+          let mut sizes: Vec<(usize, usize)> = (1..planes).map(size).collect();
+          sizes.dedup();
+          if !luma_matching {
+            sizes.clear();
+          }
+          let scaled: Vec<(Plane, Plane)> = sizes
+            .par_iter()
+            .map(|&(w, h)| rayon::join(|| a_basic.planes[0].downscale(w, h), || b_basic.planes[0].downscale(w, h)))
+            .collect();
+          // The planes are measured at once, as each alone leaves threads idle.
+          (0..planes)
+            .into_par_iter()
+            .map(|p| {
+              let matching = sizes
+                .iter()
+                .position(|&s| p > 0 && s == size(p))
+                .map(|i| (&scaled[i].0, &scaled[i].1));
+              NoiseStats::pair_blocks(
+                &a.planes[p],
+                &a_basic.planes[p],
+                &b.planes[p],
+                &b_basic.planes[p],
+                matching,
+                transforms,
+              )
+            })
+            .collect()
+        }),
+      },
+    };
+    self.add_seconds(if pair { 2 } else { 1 }, start);
+    Ok(blocks)
+  }
+
+  /// Takes the medians of a frame's measured blocks and keeps the measurements.
+  fn keep_measures(&mut self, index: usize, blocks: Measures) {
+    let start = std::time::Instant::now();
+    let maxval = self.maxval;
+    let luma_matching = self.settings.chroma_luma_matching;
+    let noisy = self.noisy.get_mut(&index).unwrap();
+    if let Some(residual) = &blocks.residual {
+      noisy.residual = Some(residual.par_iter().map(|b| NoiseStats::from_residual(b, maxval)).collect());
     }
-    let scaled: Vec<(Plane, Plane)> = sizes
-      .par_iter()
-      .map(|&(w, h)| rayon::join(|| a_basic.planes[0].downscale(w, h), || b_basic.planes[0].downscale(w, h)))
-      .collect();
-    // The planes are measured at once, as each alone leaves threads idle.
-    let temporal = (0..planes)
-      .into_par_iter()
-      .map(|p| {
-        let matching = sizes
-          .iter()
-          .position(|&s| p > 0 && s == size(p))
-          .map(|i| (&scaled[i].0, &scaled[i].1));
-        NoiseStats::measure_temporal(
-          &a.frame.planes[p],
-          &a_basic.planes[p],
-          &b.frame.planes[p],
-          &b_basic.planes[p],
-          matching,
-          self.maxval,
-          &self.transforms,
-        )
-      })
-      .collect();
-    self.add_seconds(2, start);
-    self.noisy.get_mut(&index).unwrap().temporal = Some(temporal);
+    if let Some(pairs) = &blocks.pairs {
+      // Chroma matched on luma leaves cuts to luma.
+      let temporal = pairs
+        .par_iter()
+        .enumerate()
+        .map(|(p, b)| NoiseStats::from_pairs(b, !(p > 0 && luma_matching), maxval))
+        .collect();
+      noisy.temporal = Some(temporal);
+    }
+    self.add_seconds(if blocks.pairs.is_some() { 2 } else { 1 }, start);
   }
 
   /// Redoes frames made before their scene had a measured pair, once it has one.
@@ -591,18 +678,19 @@ impl Denoiser {
     }
     let measured = self.noisy[&index].temporal.as_ref().is_some_and(|t| !t[0].is_empty());
     if measured && !self.bootstrapped.is_empty() {
-      let redo: Vec<usize> = std::mem::take(&mut self.bootstrapped)
-        .into_iter()
-        .filter(|&j| j >= self.next_final)
-        .collect();
+      // A frame whose second stage is in flight is done already.
+      let open = self.in_flight.as_ref().map_or(self.next_final, |(i, _)| i + 1);
+      let redo: Vec<usize> = std::mem::take(&mut self.bootstrapped).into_iter().filter(|&j| j >= open).collect();
       for &j in &redo {
         let (models, _) = self.hard_models(j, j.saturating_sub(radius), index);
         self.run_basic(j, models)?;
-        self.measure_residual(j);
+        self.measure(j, true, false)?;
       }
       for &j in &redo {
-        self.measure_pair(j);
-        self.measure_pair(j + 1);
+        self.measure(j, false, true)?;
+        if self.noisy.contains_key(&(j + 1)) && self.basic.contains_key(&(j + 1)) {
+          self.measure(j + 1, false, true)?;
+        }
       }
     }
     Ok(())
@@ -651,7 +739,7 @@ impl Denoiser {
         motion_guide: (p > 0).then(|| (first..=last).map(|i| &self.basic[&i].planes[0]).collect()),
       })
       .collect();
-    let submitted = self.submit_planes(Stage::Wiener, &windows, &models, &self.settings.wiener)?;
+    let submitted = self.submit_planes(Stage::Wiener, &windows, &models, &self.settings.wiener, None)?;
     drop(windows);
     self.wiener_models.insert(index, models);
     Ok(submitted)
@@ -660,7 +748,7 @@ impl Denoiser {
   /// Waits for a frame's second stage.
   fn finish_final(&self, submitted: Submitted) -> Result<Frame> {
     Ok(Frame {
-      planes: self.collect(submitted)?,
+      planes: self.collect(submitted)?.0,
     })
   }
 }

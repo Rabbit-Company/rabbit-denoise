@@ -18,13 +18,44 @@ const MEDIAN_CHI2: f32 = 0.454_936_4;
 const AV1_PEAK: f32 = 6.0;
 // The residual and pair measurements take every BLOCK_STRIDE-th block in each direction.
 // That still leaves about 8000 blocks in a 1080p frame.
-const BLOCK_STRIDE: usize = 2;
+pub const BLOCK_STRIDE: usize = 2;
+// How far the pair measurement looks for each block in the second frame.
+pub const PAIR_RADIUS: usize = 6;
 // Fewer kept blocks than this and a band borrows from its neighbours.
 const MIN_BLOCKS: u32 = 48;
 // Blocks this flat are black bars or clipped highlights, which carry no grain.
 const MIN_BLOCK_VARIANCE: f32 = 0.05;
 // Most energy a block may have, over the flattest tenth's, and still count as grain.
 const PLAUSIBLE_RATIO: f32 = 20.0;
+
+/// A block of the first frame of a pair and its best match in the second.
+#[derive(Clone, Copy)]
+pub struct PairBlock {
+  /// The DCT of the halved difference of the noisy blocks.
+  pub spectrum: [f32; AREA],
+  /// The squared differences of the matched blocks, summed.
+  pub distance: f32,
+  /// The mean of the first frame's basic estimate over the block.
+  pub mean: f32,
+}
+
+/// A block of what the basic estimate removed.
+#[derive(Clone, Copy)]
+pub struct ResidualBlock {
+  /// The DCT of the noisy block less the basic one.
+  pub spectrum: [f32; AREA],
+  /// The energy of the basic block's DCT without its DC coefficient.
+  pub kept: f32,
+  /// The basic block's DC coefficient.
+  pub dc: f32,
+}
+
+/// A frame's measured blocks for each plane, where they were measured, before their
+/// medians are taken.
+pub struct Measures {
+  pub pairs: Option<Vec<Vec<PairBlock>>>,
+  pub residual: Option<Vec<Vec<ResidualBlock>>>,
+}
 
 /// What one frame's plane says about its grain.
 #[derive(Clone)]
@@ -127,32 +158,49 @@ impl NoiseStats {
   /// Measures the grain in what the basic estimate removed, in the blocks where the detail
   /// it kept is weaker than what it removed.
   pub fn measure_residual(noisy: &Plane, basic: &Plane, maxval: f32, transforms: &Transforms) -> Self {
+    Self::from_residual(&Self::residual_blocks(noisy, basic, transforms), maxval)
+  }
+
+  /// Every BLOCK_STRIDE-th block of the residual, for `from_residual`.
+  pub fn residual_blocks(noisy: &Plane, basic: &Plane, transforms: &Transforms) -> Vec<ResidualBlock> {
     let (bw, bh) = (noisy.width / N, noisy.height / N);
-    let mut spectra = Vec::with_capacity(bw * bh);
-    let mut selected: Vec<Vec<usize>> = vec![Vec::new(); BANDS];
-    let (mut patch, mut spectrum, mut basic_spectrum) = ([0.0f32; AREA], [0.0f32; AREA], [0.0f32; AREA]);
-    for by in (0..bh).step_by(BLOCK_STRIDE) {
-      for bx in (0..bw).step_by(BLOCK_STRIDE) {
-        for y in 0..N {
-          patch[y * N..(y + 1) * N].copy_from_slice(basic.row(bx * N, by * N + y, N));
-        }
-        transforms.forward(&patch, &mut basic_spectrum);
-        for y in 0..N {
-          let (n, b) = (noisy.row(bx * N, by * N + y, N), basic.row(bx * N, by * N + y, N));
-          for x in 0..N {
-            patch[y * N + x] = n[x] - b[x];
+    (0..bh.div_ceil(BLOCK_STRIDE))
+      .into_par_iter()
+      .map(|k| k * BLOCK_STRIDE)
+      .flat_map_iter(|by| {
+        (0..bw).step_by(BLOCK_STRIDE).map(move |bx| {
+          let (mut patch, mut spectrum, mut basic_spectrum) = ([0.0f32; AREA], [0.0f32; AREA], [0.0f32; AREA]);
+          for y in 0..N {
+            patch[y * N..(y + 1) * N].copy_from_slice(basic.row(bx * N, by * N + y, N));
           }
-        }
-        transforms.forward(&patch, &mut spectrum);
-        let kept: f32 = basic_spectrum[1..].iter().map(|c| c * c).sum();
-        let removed: f32 = spectrum[1..].iter().map(|c| c * c).sum();
-        let index = spectra.len();
-        spectra.push(spectrum);
-        if removed >= MIN_BLOCK_VARIANCE * AREA as f32 && kept < removed {
-          selected[band(basic_spectrum[0] / N as f32, maxval)].push(index);
-        }
+          transforms.forward(&patch, &mut basic_spectrum);
+          for y in 0..N {
+            let (n, b) = (noisy.row(bx * N, by * N + y, N), basic.row(bx * N, by * N + y, N));
+            for x in 0..N {
+              patch[y * N + x] = n[x] - b[x];
+            }
+          }
+          transforms.forward(&patch, &mut spectrum);
+          ResidualBlock {
+            spectrum,
+            kept: basic_spectrum[1..].iter().map(|c| c * c).sum(),
+            dc: basic_spectrum[0],
+          }
+        })
+      })
+      .collect()
+  }
+
+  /// The residual measurement from every BLOCK_STRIDE-th block, as the GPU makes them too.
+  pub fn from_residual(blocks: &[ResidualBlock], maxval: f32) -> Self {
+    let mut selected: Vec<Vec<usize>> = vec![Vec::new(); BANDS];
+    for (i, block) in blocks.iter().enumerate() {
+      let removed: f32 = block.spectrum[1..].iter().map(|c| c * c).sum();
+      if removed >= MIN_BLOCK_VARIANCE * AREA as f32 && block.kept < removed {
+        selected[band(block.dc / N as f32, maxval)].push(i);
       }
     }
+    let spectra: Vec<[f32; AREA]> = blocks.iter().map(|b| b.spectrum).collect();
     Self::from_blocks(&spectra, &selected, true)
   }
 
@@ -172,9 +220,19 @@ impl NoiseStats {
     maxval: f32,
     transforms: &Transforms,
   ) -> Self {
-    const RADIUS: usize = 6;
-    const WORST_RATIO: f32 = 4.0;
-    const CUT_RATIO: f32 = 0.5;
+    let blocks = Self::pair_blocks(noisy_a, basic_a, noisy_b, basic_b, matching, transforms);
+    Self::from_pairs(&blocks, matching.is_none(), maxval)
+  }
+
+  /// Every BLOCK_STRIDE-th block of frame a with its match in frame b, for `from_pairs`.
+  pub fn pair_blocks(
+    noisy_a: &Plane,
+    basic_a: &Plane,
+    noisy_b: &Plane,
+    basic_b: &Plane,
+    matching: Option<(&Plane, &Plane)>,
+    transforms: &Transforms,
+  ) -> Vec<PairBlock> {
     let (width, height) = (noisy_a.width, noisy_a.height);
     let (bw, bh) = (width / N, height / N);
     let load = |plane: &Plane, x: usize, y: usize| -> [f32; AREA] {
@@ -184,8 +242,7 @@ impl NoiseStats {
       }
       out
     };
-    // Per block: its band, the halved difference spectrum, and the basic and noisy distances.
-    let found: Vec<(usize, [f32; AREA], f32, f32)> = (0..bh.div_ceil(BLOCK_STRIDE))
+    (0..bh.div_ceil(BLOCK_STRIDE))
       .into_par_iter()
       .map(|k| k * BLOCK_STRIDE)
       .flat_map_iter(|by| {
@@ -195,8 +252,8 @@ impl NoiseStats {
           let (match_a, match_b) = matching.unwrap_or((basic_a, basic_b));
           let reference = load(match_a, x, y);
           let (mut best, mut at) = (f32::MAX, (x, y));
-          for my in y.saturating_sub(RADIUS)..=(y + RADIUS).min(height - N) {
-            for mx in x.saturating_sub(RADIUS)..=(x + RADIUS).min(width - N) {
+          for my in y.saturating_sub(PAIR_RADIUS)..=(y + PAIR_RADIUS).min(height - N) {
+            for mx in x.saturating_sub(PAIR_RADIUS)..=(x + PAIR_RADIUS).min(width - N) {
               let mut sum = 0.0;
               for row in 0..N {
                 let candidate = match_b.row(mx, my + row, N);
@@ -218,16 +275,30 @@ impl NoiseStats {
           let difference: [f32; AREA] = std::array::from_fn(|i| (a[i] - b[i]) * std::f32::consts::FRAC_1_SQRT_2);
           let mut spectrum = [0.0f32; AREA];
           transforms.forward(&difference, &mut spectrum);
-          let ac: f32 = spectrum[1..].iter().map(|c| c * c).sum::<f32>() / AREA as f32;
-          if ac < MIN_BLOCK_VARIANCE {
-            continue;
-          }
-          let mean = load(basic_a, x, y).iter().sum::<f32>() / AREA as f32;
-          // The halved difference's energy is half the noisy blocks' distance.
-          let noisy_distance = spectrum.iter().map(|c| c * c).sum::<f32>() * 2.0 / AREA as f32;
-          out.push((band(mean, maxval), spectrum, best / AREA as f32, noisy_distance));
+          out.push(PairBlock {
+            spectrum,
+            distance: best,
+            mean: load(basic_a, x, y).iter().sum::<f32>() / AREA as f32,
+          });
         }
         out
+      })
+      .collect()
+  }
+
+  /// The pair measurement from every BLOCK_STRIDE-th block of the first frame, as the GPU
+  /// makes them too. With `cuts`, a pair across a scene cut measures nothing.
+  pub fn from_pairs(blocks: &[PairBlock], cuts: bool, maxval: f32) -> Self {
+    const WORST_RATIO: f32 = 4.0;
+    const CUT_RATIO: f32 = 0.5;
+    // Per block: its band, the halved difference spectrum, and the basic and noisy distances.
+    let found: Vec<(usize, [f32; AREA], f32, f32)> = blocks
+      .iter()
+      .filter(|b| b.spectrum[1..].iter().map(|c| c * c).sum::<f32>() / AREA as f32 >= MIN_BLOCK_VARIANCE)
+      .map(|b| {
+        // The halved difference's energy is half the noisy blocks' distance.
+        let noisy_distance = b.spectrum.iter().map(|c| c * c).sum::<f32>() * 2.0 / AREA as f32;
+        (band(b.mean, maxval), b.spectrum, b.distance / AREA as f32, noisy_distance)
       })
       .collect();
     if found.is_empty() {
@@ -251,7 +322,7 @@ impl NoiseStats {
     // Across a scene cut the basic and noisy distances come close, as both are mostly picture.
     let mut noisy_distances: Vec<f32> = found.iter().map(|f| f.3).collect();
     let (_, noisy_typical, _) = noisy_distances.select_nth_unstable_by(mid, f32::total_cmp);
-    if matching.is_none() && typical > *noisy_typical * CUT_RATIO {
+    if cuts && typical > *noisy_typical * CUT_RATIO {
       return Self {
         variance: vec![[0.0; AREA]; BANDS],
         blocks: vec![0; BANDS],

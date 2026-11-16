@@ -1,5 +1,10 @@
-//! The GPU filter against the CPU reference on a small synthetic clip. Skipped without a GPU.
+//! The GPU filter and grain measurement against the CPU reference on a small synthetic
+//! clip. Skipped without a GPU.
 
+use rabbit_denoise::bm3d::FrameKey;
+use rabbit_denoise::dct::Transforms;
+use rabbit_denoise::gpu::{Gpu, MeasureFrame};
+use rabbit_denoise::noise::NoiseStats;
 use rabbit_denoise::{Denoiser, Device, Frame, Plane, Settings};
 
 struct Rng(u64);
@@ -83,4 +88,65 @@ fn gpu_matches_cpu() {
   }
   let psnr = 10.0 * (1023.0f64 * 1023.0 * count as f64 / error.max(1e-12)).log10();
   assert!(psnr > 60.0, "GPU and CPU differ: {psnr:.1} dB");
+}
+
+#[test]
+fn gpu_measures_grain_as_cpu() {
+  let input = clip(4);
+  // The first stage's results, which the measurements compare the frames with.
+  let mut settings = Settings::new(2);
+  settings.device = Device::Cpu;
+  settings.basic_only = true;
+  let mut denoiser = Denoiser::new(settings, 10).unwrap();
+  let mut basic = Vec::new();
+  for frame in &input {
+    basic.extend(denoiser.push(frame.clone()).unwrap());
+  }
+  basic.extend(denoiser.finish().unwrap());
+  let gpu = match Gpu::new(false) {
+    Ok(gpu) => gpu,
+    Err(e) => {
+      eprintln!("skipped: {e:#}");
+      return;
+    }
+  };
+  let frame = |i: usize| MeasureFrame {
+    noisy: &input[i].planes,
+    basic: &basic[i].planes,
+    noisy_key: FrameKey { index: i, version: 0 },
+    basic_key: FrameKey { index: i, version: 1 },
+  };
+  let measured = gpu.measure(&frame(2), Some(&frame(1)), true, true, [12, 12]).unwrap();
+  let (pairs, residual) = (measured.pairs.unwrap(), measured.residual.unwrap());
+  let transforms = Transforms::new(16);
+  let close = |what: &str, a: &[f32], b: &[f32]| {
+    for (x, y) in a.iter().zip(b) {
+      assert!((x - y).abs() <= 1e-3 * x.abs().max(1.0), "{what}: CPU {x}, GPU {y}");
+    }
+  };
+  for p in 0..3 {
+    let (a, b) = (&input[1].planes[p], &input[2].planes[p]);
+    let (a_basic, b_basic) = (&basic[1].planes[p], &basic[2].planes[p]);
+    // Chroma is matched on luma at its size.
+    let scaled = (p > 0).then(|| {
+      (
+        basic[1].planes[0].downscale(a.width, a.height),
+        basic[2].planes[0].downscale(a.width, a.height),
+      )
+    });
+    let cpu = NoiseStats::pair_blocks(a, a_basic, b, b_basic, scaled.as_ref().map(|(x, y)| (x, y)), &transforms);
+    assert_eq!(cpu.len(), pairs[p].len());
+    for (i, (c, g)) in cpu.iter().zip(&pairs[p]).enumerate() {
+      let what = format!("plane {p}, pair block {i}");
+      close(&what, &c.spectrum, &g.spectrum);
+      close(&what, &[c.distance, c.mean], &[g.distance, g.mean]);
+    }
+    let cpu = NoiseStats::residual_blocks(b, b_basic, &transforms);
+    assert_eq!(cpu.len(), residual[p].len());
+    for (i, (c, g)) in cpu.iter().zip(&residual[p]).enumerate() {
+      let what = format!("plane {p}, residual block {i}");
+      close(&what, &c.spectrum, &g.spectrum);
+      close(&what, &[c.kept, c.dc], &[g.kept, g.dc]);
+    }
+  }
 }

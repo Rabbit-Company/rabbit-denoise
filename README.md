@@ -29,8 +29,8 @@ A build that is too new for the CPU crashes with an illegal instruction error an
 On Linux and macOS:
 
 ```sh
-tar -xzf rabbit-denoise-v0.1.3-linux-x86_64-v3.tar.gz
-sudo install rabbit-denoise-v0.1.3-linux-x86_64-v3/rabbit-denoise /usr/local/bin/
+tar -xzf rabbit-denoise-v0.1.4-linux-x86_64-v3.tar.gz
+sudo install rabbit-denoise-v0.1.4-linux-x86_64-v3/rabbit-denoise /usr/local/bin/
 ```
 
 The macOS binaries are not signed. If macOS refuses to open it, clear the quarantine flag once:

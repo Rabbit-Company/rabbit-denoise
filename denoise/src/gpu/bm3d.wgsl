@@ -1052,6 +1052,24 @@ var<workgroup> kept_count: u32;
 // Each pixel goes to the accumulators once, as atomics cost most of the time on some GPUs.
 var<workgroup> sums: array<f32, 2u * TILE_SIDE * TILE_SIDE>;
 
+// The DCT basis values thread t's row and column need, loaded once by load_basis: forward,
+// then inverse.
+var<private> basis_col: array<f32, 8>;
+var<private> basis_row: array<f32, 8>;
+var<private> inverse_col: array<f32, 8>;
+var<private> inverse_row: array<f32, 8>;
+
+fn load_basis(t: u32) {
+  let row = t / N;
+  let col = t % N;
+  for (var i = 0u; i < N; i++) {
+    basis_col[i] = tables[DCT + col * N + i];
+    basis_row[i] = tables[DCT + row * N + i];
+    inverse_col[i] = tables[DCT + i * N + col];
+    inverse_row[i] = tables[DCT + i * N + row];
+  }
+}
+
 // Coefficient t of the 8x8 DCT of the patch whose pixel t is `value`. Every thread calls it.
 fn dct(t: u32, value: f32) -> f32 {
   let row = t / N;
@@ -1061,13 +1079,13 @@ fn dct(t: u32, value: f32) -> f32 {
   workgroupBarrier();
   var s = 0.0;
   for (var x = 0u; x < N; x++) {
-    s += tables[DCT + col * N + x] * tile[row * N + x];
+    s += basis_col[x] * tile[row * N + x];
   }
   rows[t] = s;
   workgroupBarrier();
   var out = 0.0;
   for (var y = 0u; y < N; y++) {
-    out += tables[DCT + row * N + y] * rows[y * N + col];
+    out += basis_row[y] * rows[y * N + col];
   }
   return out;
 }
@@ -1081,13 +1099,13 @@ fn inverse_dct(t: u32, value: f32) -> f32 {
   workgroupBarrier();
   var s = 0.0;
   for (var u = 0u; u < N; u++) {
-    s += tables[DCT + u * N + col] * tile[row * N + u];
+    s += inverse_col[u] * tile[row * N + u];
   }
   rows[t] = s;
   workgroupBarrier();
   var out = 0.0;
   for (var v = 0u; v < N; v++) {
-    out += tables[DCT + v * N + row] * rows[v * N + col];
+    out += inverse_row[v] * rows[v * N + col];
   }
   return out;
 }
@@ -1132,6 +1150,7 @@ fn filter_groups(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation
     region = vec4<u32>(x0, y0, x1 - x0, y1 - y0);
   }
   workgroupBarrier();
+  load_basis(t);
   let area = region.z * region.w;
   for (var i = t; i < area; i += 64u) {
     sums[i] = 0.0;

@@ -2,6 +2,12 @@
 
 Error codes and JSON field names stay compatible within a major version. Messages meant for people may change in any release. Before 1.0, a minor version may change the defaults and the options.
 
+## 0.1.4 - 2026-11-16
+
+### Changes
+
+- About 5 per cent faster on grainy video, from 19.6 to 20.7 fps at 1080p on a Radeon RX 9060 XT. `filter_groups` keeps the DCT values each thread needs in registers, instead of reading them for every patch.
+
 ## 0.1.3 - 2026-11-16
 
 ### Changes

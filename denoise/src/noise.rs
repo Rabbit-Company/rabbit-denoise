@@ -21,6 +21,22 @@ const AV1_PEAK: f32 = 6.0;
 pub const BLOCK_STRIDE: usize = 2;
 // How far the pair measurement looks for each block in the second frame.
 pub const PAIR_RADIUS: usize = 6;
+// Measured blocks start this far off the 8x8 grid. Codecs such as H.264 quantize the grain
+// in 8x8 and 4x4 transforms on that grid, which zeroes most of a block's high frequencies
+// and keeps a few large ones. Their median then puts the grain three to four times too
+// weak, and the filter, whose patches sit everywhere, keeps those frequencies as squares of
+// checkerboards and stripes. Three samples off, no power of two grid lines up with a block.
+pub const GRID_OFFSET: usize = 3;
+
+/// How many measured blocks fit along a plane side of `len` samples.
+pub fn grid_blocks(len: usize) -> usize {
+  len.saturating_sub(GRID_OFFSET) / N
+}
+
+/// Where measured block `index` starts along a plane side.
+pub fn grid_start(index: usize) -> usize {
+  GRID_OFFSET + index * N
+}
 // Fewer kept blocks than this and a band borrows from its neighbours.
 const MIN_BLOCKS: u32 = 48;
 // Blocks this flat are black bars or clipped highlights, which carry no grain.
@@ -66,11 +82,11 @@ pub struct NoiseStats {
 
 impl NoiseStats {
   pub fn measure(plane: &Plane, maxval: f32, transforms: &Transforms) -> Self {
-    let (bw, bh) = (plane.width / N, plane.height / N);
+    let (bw, bh) = (grid_blocks(plane.width), grid_blocks(plane.height));
     let load = |bx: usize, by: usize| -> [f32; AREA] {
       let mut patch = [0.0f32; AREA];
       for y in 0..N {
-        patch[y * N..(y + 1) * N].copy_from_slice(plane.row(bx * N, by * N + y, N));
+        patch[y * N..(y + 1) * N].copy_from_slice(plane.row(grid_start(bx), grid_start(by) + y, N));
       }
       patch
     };
@@ -163,19 +179,20 @@ impl NoiseStats {
 
   /// Every BLOCK_STRIDE-th block of the residual, for `from_residual`.
   pub fn residual_blocks(noisy: &Plane, basic: &Plane, transforms: &Transforms) -> Vec<ResidualBlock> {
-    let (bw, bh) = (noisy.width / N, noisy.height / N);
+    let (bw, bh) = (grid_blocks(noisy.width), grid_blocks(noisy.height));
     (0..bh.div_ceil(BLOCK_STRIDE))
       .into_par_iter()
       .map(|k| k * BLOCK_STRIDE)
       .flat_map_iter(|by| {
         (0..bw).step_by(BLOCK_STRIDE).map(move |bx| {
+          let (x, y0) = (grid_start(bx), grid_start(by));
           let (mut patch, mut spectrum, mut basic_spectrum) = ([0.0f32; AREA], [0.0f32; AREA], [0.0f32; AREA]);
           for y in 0..N {
-            patch[y * N..(y + 1) * N].copy_from_slice(basic.row(bx * N, by * N + y, N));
+            patch[y * N..(y + 1) * N].copy_from_slice(basic.row(x, y0 + y, N));
           }
           transforms.forward(&patch, &mut basic_spectrum);
           for y in 0..N {
-            let (n, b) = (noisy.row(bx * N, by * N + y, N), basic.row(bx * N, by * N + y, N));
+            let (n, b) = (noisy.row(x, y0 + y, N), basic.row(x, y0 + y, N));
             for x in 0..N {
               patch[y * N + x] = n[x] - b[x];
             }
@@ -234,7 +251,7 @@ impl NoiseStats {
     transforms: &Transforms,
   ) -> Vec<PairBlock> {
     let (width, height) = (noisy_a.width, noisy_a.height);
-    let (bw, bh) = (width / N, height / N);
+    let (bw, bh) = (grid_blocks(width), grid_blocks(height));
     let load = |plane: &Plane, x: usize, y: usize| -> [f32; AREA] {
       let mut out = [0.0; AREA];
       for row in 0..N {
@@ -248,7 +265,7 @@ impl NoiseStats {
       .flat_map_iter(|by| {
         let mut out = Vec::with_capacity(bw);
         for bx in (0..bw).step_by(BLOCK_STRIDE) {
-          let (x, y) = (bx * N, by * N);
+          let (x, y) = (grid_start(bx), grid_start(by));
           let (match_a, match_b) = matching.unwrap_or((basic_a, basic_b));
           let reference = load(match_a, x, y);
           let (mut best, mut at) = (f32::MAX, (x, y));
@@ -527,6 +544,49 @@ mod tests {
     for f in [9, 27, 36, 63] {
       assert!((spectrum[f] / 36.0 - 1.0).abs() < 0.15, "frequency {f}: {}", spectrum[f]);
     }
+  }
+
+  // Grain an encoder quantized in 8x8 transforms on the grid: most coefficients of every
+  // block are zero and the rest are large. Measured on that grid, their median put the
+  // grain three to four times too weak.
+  #[test]
+  fn grain_quantized_on_the_codec_grid_is_measured() {
+    let (w, h) = (1024, 512);
+    let mut plane = Plane::new(w, h);
+    let mut rng = Rng(99);
+    let t = Transforms::new(1);
+    let sigma = 6.0f32;
+    let (mut sum, mut sum_sq) = (0.0f64, 0.0f64);
+    for by in 0..h / N {
+      for bx in 0..w / N {
+        let grain: [f32; AREA] = std::array::from_fn(|_| sigma * rng.gauss());
+        let mut spectrum = [0.0f32; AREA];
+        t.forward(&grain, &mut spectrum);
+        for c in spectrum.iter_mut() {
+          if c.abs() < 1.2 * sigma {
+            *c = 0.0;
+          }
+        }
+        let mut patch = [0.0f32; AREA];
+        t.inverse(&spectrum, &mut patch);
+        for y in 0..N {
+          for x in 0..N {
+            let v = patch[y * N + x] as f64;
+            sum += v;
+            sum_sq += v * v;
+            plane.data[(by * N + y) * w + bx * N + x] = 400.0 + patch[y * N + x];
+          }
+        }
+      }
+    }
+    let n = (w * h) as f64;
+    let actual = (sum_sq / n - (sum / n).powi(2)) as f32;
+    let stats = NoiseStats::measure(&plane, 1023.0, &t);
+    let model = NoiseModel::combine(&[&stats], 1023.0, 1.0);
+    let mut spectrum = [0.0; AREA];
+    model.variance(400.0, &mut spectrum);
+    let measured = spectrum[1..].iter().sum::<f32>() / (AREA - 1) as f32;
+    assert!((measured / actual - 1.0).abs() < 0.25, "measured {measured}, actual {actual}");
   }
 
   #[test]

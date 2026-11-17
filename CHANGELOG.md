@@ -2,6 +2,12 @@
 
 Error codes and JSON field names stay compatible within a major version. Messages meant for people may change in any release. Before 1.0, a minor version may change the defaults and the options.
 
+## 0.1.7 - 2026-11-17
+
+### Fixes
+
+- Video compressed with H.264, such as a Blu-ray in AVC or a web release, came out with squares of fine checkerboards and stripes in flat areas, where the grain was left in parts. The codec quantizes the grain in transforms on the 8x8 grid, so on that grid most high frequencies of a block are zero and a few are large. rabbit-denoise measured the grain on the same grid, and the median it takes put those frequencies 2.5 to 4.5 times too weak in variance, so the filter kept them wherever they cleared the low threshold. The grain is now measured on blocks 3 samples off the grid. On a 1080p film scan in H.264, the grain left at the finest frequencies in flat areas fell from 36 to 1 per cent of the source's, and the 8x8 grid in the output from 26 per cent stronger edges than elsewhere to none. Such sources lose more grain and also more texture as faint as the grain, so use `--sigma-scale 0.8` to keep more of it. On known grain compressed with x264 the result is 0.9 dB closer to the clean picture on average and up to 2.4 dB, with x265 0.1 dB. Lossless grain and the HEVC anime and film clips tested are unchanged within 0.05 dB.
+
 ## 0.1.6 - 2026-11-16
 
 ### Changes

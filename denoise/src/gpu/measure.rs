@@ -4,7 +4,7 @@
 use super::{DISPATCH_X, Gpu, Kind, WORKGROUP};
 use crate::bm3d::FrameKey;
 use crate::dct::{AREA, N, basis};
-use crate::noise::{BLOCK_STRIDE, Measures, PairBlock, ResidualBlock};
+use crate::noise::{BLOCK_STRIDE, Measures, PairBlock, ResidualBlock, grid_blocks};
 use crate::plane::Plane;
 use anyhow::{Context, Result, bail};
 use std::sync::mpsc::Sender;
@@ -221,7 +221,10 @@ impl Gpu {
     let mut counts = Vec::with_capacity(planes.len());
     for (p, plane) in planes.iter().enumerate() {
       let (width, height) = (plane.width, plane.height);
-      let (blocks_x, blocks_y) = ((width / N).div_ceil(BLOCK_STRIDE), (height / N).div_ceil(BLOCK_STRIDE));
+      let (blocks_x, blocks_y) = (
+        grid_blocks(width).div_ceil(BLOCK_STRIDE),
+        grid_blocks(height).div_ceil(BLOCK_STRIDE),
+      );
       let blocks = blocks_x * blocks_y;
       counts.push(blocks);
       if blocks == 0 {
@@ -381,7 +384,7 @@ impl Gpu {
 
   fn measure_buffers(&self, shape: (usize, usize, bool)) -> MeasureWork {
     let (width, height, scaled) = shape;
-    let blocks = (width / N).div_ceil(BLOCK_STRIDE) * (height / N).div_ceil(BLOCK_STRIDE);
+    let blocks = grid_blocks(width).div_ceil(BLOCK_STRIDE) * grid_blocks(height).div_ceil(BLOCK_STRIDE);
     let bytes = 2 * blocks * BLOCK * 4;
     MeasureWork {
       out: self.buffer("measure", bytes, wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC),

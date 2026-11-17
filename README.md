@@ -29,8 +29,8 @@ A build that is too new for the CPU crashes with an illegal instruction error an
 On Linux and macOS:
 
 ```sh
-tar -xzf rabbit-denoise-v0.1.6-linux-x86_64-v3.tar.gz
-sudo install rabbit-denoise-v0.1.6-linux-x86_64-v3/rabbit-denoise /usr/local/bin/
+tar -xzf rabbit-denoise-v0.1.7-linux-x86_64-v3.tar.gz
+sudo install rabbit-denoise-v0.1.7-linux-x86_64-v3/rabbit-denoise /usr/local/bin/
 ```
 
 The macOS binaries are not signed. If macOS refuses to open it, clear the quarantine flag once:
@@ -216,6 +216,7 @@ What sets it apart is how it measures the grain:
 - **Per frequency and brightness.** The model holds the grain variance of each of the 64 DCT frequencies for 16 brightness bands, the same things AV1 describes with its AR filter and scaling function.
 - **Over time.** A block found again in the next frame differs from it by grain alone. On known grain this lands within a few per cent of the truth, where single frames read 20 to 130 per cent high on texture. Pairs across a scene cut are dropped, and the first frames of a scene are redone once a pair is measured.
 - **Only fine grain.** Film grain is strongest at middle and high frequencies, so the model caps every frequency at 6 times the high frequency grain, which is also the most AV1 grain synthesis can draw again. Coarse, blotchy noise beyond that stays, as removing it would mostly take fine dark texture with it.
+- **Off the codec grid.** The grain is measured on 8x8 blocks that start 3 samples off the grid. H.264 and other codecs quantize the grain in transforms on that grid, which leaves most of a block's high frequencies at zero and a few large. Measured on the grid, the grain of such a source read 2.5 to 4.5 times too weak in variance, and the filter left the frequencies it missed as squares of checkerboards and stripes.
 - **Two measurements that check each other.** Motion reads high between frames and texture reads high in single frames, so the model takes the smaller of the two.
 - **Chroma matched on luma.** Chroma's grain is measured with blocks matched on the luma first stage result.
 - **Motion fields.** A patch is followed by searching around its track and around where the motion field moves it. That is 0.15 to 0.25 dB better and 16 to 20 per cent faster than tracking alone. Chroma follows the luma field.

@@ -10,9 +10,10 @@
 
 const N: u32 = 8u;
 const AREA: u32 = 64u;
-// noise.rs PAIR_RADIUS and BLOCK_STRIDE.
+// noise.rs PAIR_RADIUS, BLOCK_STRIDE and GRID_OFFSET.
 const RADIUS: u32 = 6u;
 const STRIDE: u32 = 2u;
+const OFFSET: u32 = 3u;
 // Per block in out: 64 coefficients, then two numbers.
 const BLOCK: u32 = 66u;
 
@@ -128,8 +129,8 @@ fn pair_blocks(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_i
   if (i >= params.blocks_x * params.blocks_y) {
     return;
   }
-  let x = (i % params.blocks_x) * STRIDE * N;
-  let y = (i / params.blocks_x) * STRIDE * N;
+  let x = OFFSET + (i % params.blocks_x) * STRIDE * N;
+  let y = OFFSET + (i / params.blocks_x) * STRIDE * N;
   let ax = select(0u, x - RADIUS, x >= RADIUS);
   let ay = select(0u, y - RADIUS, y >= RADIUS);
   let x1 = min(x + RADIUS, params.width - N);
@@ -210,8 +211,8 @@ fn residual_blocks(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocati
   if (i >= params.blocks_x * params.blocks_y) {
     return;
   }
-  let x = (i % params.blocks_x) * STRIDE * N;
-  let y = (i / params.blocks_x) * STRIDE * N;
+  let x = OFFSET + (i % params.blocks_x) * STRIDE * N;
+  let y = OFFSET + (i / params.blocks_x) * STRIDE * N;
   let p = (y + t / N) * params.width + x + t % N;
   let b = basic[params.basic_b + p];
   let at = params.residual_out + i * BLOCK;

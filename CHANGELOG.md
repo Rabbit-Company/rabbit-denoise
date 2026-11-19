@@ -2,6 +2,17 @@
 
 Error codes and JSON field names stay compatible within a major version. Messages meant for people may change in any release. Before 1.0, a minor version may change the defaults and the options.
 
+## 0.1.8 - 2026-11-19
+
+### Features
+
+- `rabbit-denoise analyze` splits a video into scenes and measures the grain of each, without denoising. The grain is the deviation of the luma grain in 8 bit code values, measured on single frames and between pairs of frames, so that neither texture nor motion reads as grain. With `--progress json`, a `scene` event gives each scene's frames, times, luma and chroma grain, and luma grain by brightness.
+- `denoise --min-grain <X>` denoises only the scenes whose grain, as `analyze` measures it, reaches X, and copies the others unchanged. For anime, 2 denoises grainy scenes such as a grainy opening and keeps clean ones as they are. It reads the video twice, so the input must be a file. With `--progress json`, a `scenes` event reports what will be denoised, the first read's `progress` events carry `stage` `analyze`, and `summary` gives `denoised_frames`.
+
+### Changes
+
+- A closed standard output, as with `| head`, no longer ends rabbit-denoise with a panic. `denoise` goes on writing its video. `analyze` stops.
+
 ## 0.1.7 - 2026-11-17
 
 ### Fixes

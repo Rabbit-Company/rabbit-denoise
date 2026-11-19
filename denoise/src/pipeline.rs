@@ -142,6 +142,8 @@ pub struct Denoiser {
   /// Why the GPU is not used, with Device::Auto.
   gpu_note: Option<String>,
   read: usize,
+  /// The first frame of the current run. No window reaches before it.
+  base: usize,
   next_basic: usize,
   next_final: usize,
   /// A second stage left on the GPU between calls, so it always has work queued.
@@ -185,6 +187,7 @@ impl Denoiser {
       gpu_note,
       seconds: std::cell::Cell::new([0.0; 4]),
       read: 0,
+      base: 0,
       next_basic: 0,
       next_final: 0,
       in_flight: None,
@@ -317,6 +320,28 @@ impl Denoiser {
     self.advance()
   }
 
+  /// Starts a new run after `finish`, `skipped` frames further on in the video. The run
+  /// takes nothing from the frames before it, as if the stream began there, and the GPU
+  /// stays open. Frame numbers keep counting, so no frame kept on the GPU is taken for a
+  /// new one.
+  pub fn resume(&mut self, skipped: usize) {
+    assert!(
+      self.ended && self.in_flight.is_none() && self.next_final == self.read,
+      "resume before the run finished"
+    );
+    self.read += skipped;
+    self.base = self.read;
+    self.next_basic = self.read;
+    self.next_final = self.read;
+    self.noisy.clear();
+    self.basic.clear();
+    self.models.clear();
+    self.wiener_models.clear();
+    self.bootstrapped.clear();
+    self.basic_versions.clear();
+    self.ended = false;
+  }
+
   /// The noise models of the frames returned since the last call, with `keep_models`.
   pub fn take_models(&mut self) -> Vec<FrameModels> {
     std::mem::take(&mut self.returned_models)
@@ -329,7 +354,7 @@ impl Denoiser {
   }
 
   fn span(&self, index: usize, radius: usize, available: usize) -> (usize, usize) {
-    (index.saturating_sub(radius), (index + radius).min(available - 1))
+    (index.saturating_sub(radius).max(self.base), (index + radius).min(available - 1))
   }
 
   /// Whether the next frame's second stage has every basic estimate of its window.

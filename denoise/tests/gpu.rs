@@ -90,6 +90,72 @@ fn gpu_matches_cpu() {
   assert!(psnr > 60.0, "GPU and CPU differ: {psnr:.1} dB");
 }
 
+/// Denoises the frames of each run, skipping those between, as `--min-grain` does.
+fn run_runs(device: Device, input: &[Frame], runs: &[(usize, usize)]) -> Option<Vec<Vec<Frame>>> {
+  let mut settings = Settings::new(2);
+  settings.device = device;
+  let mut denoiser = match Denoiser::new(settings, 10) {
+    Ok(d) => d,
+    Err(e) if device == Device::Gpu => {
+      eprintln!("skipped: {e:#}");
+      return None;
+    }
+    Err(e) => panic!("{e:#}"),
+  };
+  let mut out = Vec::new();
+  let mut next = 0;
+  for (i, &(first, end)) in runs.iter().enumerate() {
+    if i > 0 {
+      denoiser.resume(first - next);
+    }
+    let mut frames = Vec::new();
+    for frame in &input[first..end] {
+      frames.extend(denoiser.push(frame.clone()).unwrap());
+    }
+    frames.extend(denoiser.finish().unwrap());
+    out.push(frames);
+    next = end;
+  }
+  Some(out)
+}
+
+fn psnr(a: &[Frame], b: &[Frame]) -> f64 {
+  assert_eq!(a.len(), b.len());
+  let (mut error, mut count) = (0.0f64, 0usize);
+  for (fa, fb) in a.iter().zip(b) {
+    for (pa, pb) in fa.planes.iter().zip(&fb.planes) {
+      for (x, y) in pa.data.iter().zip(&pb.data) {
+        error += ((x - y) as f64).powi(2);
+        count += 1;
+      }
+    }
+  }
+  10.0 * (1023.0f64 * 1023.0 * count as f64 / error.max(1e-12)).log10()
+}
+
+#[test]
+fn a_resumed_run_is_denoised_as_if_the_video_began_there() {
+  // The second run starts past the GPU's rings of 16 frames, and its frames would land in
+  // the slots of the first run's frames.
+  let input = clip(48);
+  let runs = [(0, 12), (18, 30), (36, 48)];
+  let alone: Vec<Vec<Frame>> = runs.iter().map(|&(a, b)| run(Device::Cpu, &input[a..b]).unwrap()).collect();
+  let cpu = run_runs(Device::Cpu, &input, &runs).unwrap();
+  for (resumed, fresh) in cpu.iter().zip(&alone) {
+    assert_eq!(resumed.len(), fresh.len());
+    for (a, b) in resumed.iter().zip(fresh) {
+      for (pa, pb) in a.planes.iter().zip(&b.planes) {
+        assert_eq!(pa.data, pb.data);
+      }
+    }
+  }
+  let Some(gpu) = run_runs(Device::Gpu, &input, &runs) else { return };
+  for (resumed, fresh) in gpu.iter().zip(&alone) {
+    let db = psnr(resumed, fresh);
+    assert!(db > 60.0, "a resumed GPU run differs from a fresh one: {db:.1} dB");
+  }
+}
+
 #[test]
 fn gpu_measures_grain_as_cpu() {
   let input = clip(4);

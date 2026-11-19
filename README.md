@@ -29,8 +29,8 @@ A build that is too new for the CPU crashes with an illegal instruction error an
 On Linux and macOS:
 
 ```sh
-tar -xzf rabbit-denoise-v0.1.7-linux-x86_64-v3.tar.gz
-sudo install rabbit-denoise-v0.1.7-linux-x86_64-v3/rabbit-denoise /usr/local/bin/
+tar -xzf rabbit-denoise-v0.1.8-linux-x86_64-v3.tar.gz
+sudo install rabbit-denoise-v0.1.8-linux-x86_64-v3/rabbit-denoise /usr/local/bin/
 ```
 
 The macOS binaries are not signed. If macOS refuses to open it, clear the quarantine flag once:
@@ -87,7 +87,7 @@ Interlaced video is refused with `unsupported_input`, as the filter would treat 
 
 The output keeps the input's bit depth and chroma layout: 8, 10 and 12 bit 4:2:0, 4:2:2 and 4:4:4, and 8 and 12 bit greyscale, at any size. Other pixel formats are converted by ffmpeg to the nearest of these, rounding the bit depth up. y4m input in other colorspaces, such as 10 bit greyscale, stops with `unsupported_input`.
 
-Like regrain and retone, every command takes `--progress <text|json|none>` and `-q`. `completions` and `manual` print a shell completion script and the manual page.
+Like regrain and retone, every command takes `--progress <text|json|none>` and `-q`. `analyze` lists a video's scenes and the grain of each, as described [below](#analyzing-scenes). `completions` and `manual` print a shell completion script and the manual page.
 
 The defaults are the best quality measured on the benchmark below. The dB figures below come from the known grain clips. Every number has a range, shown in `--help`, and values outside it are refused. The whole number ranges are what the GPU runs.
 
@@ -115,6 +115,16 @@ A file is written under a temporary name and renamed once the run succeeds. Devi
 The denoiser measures the grain itself, so these options are corrections that most videos do not need. `--sigma-scale` above 1 removes more grain and more fine detail. Below 1 it leaves some grain in, and regrain then puts back less. `--chroma-scale` does the same for colour alone. `--lambda` is the first stage's threshold. A coefficient survives only where it is this many times the grain at its frequency and brightness. The second stage has no threshold and weighs every coefficient by how much of it is picture.
 
 `--basic` is about twice as fast and about 2 dB worse.
+
+### Scenes
+
+| Option            | Default | Range     | Meaning                                                                  |
+| ----------------- | ------- | --------- | ------------------------------------------------------------------------ |
+| `--min-grain <X>` | off     | 0.1 to 50 | Denoise only the scenes whose grain reaches X, and copy the others as is |
+
+`--min-grain` keeps clean scenes exactly as they are and denoises only the grainy ones, such as a grainy opening in an otherwise clean anime episode. It first reads the whole video as [`analyze`](#analyzing-scenes) does, to find the scenes and measure their grain, and then reads it again to denoise. Scenes below X, and scenes without a measurable grain such as black screens, are copied unchanged. Every run of touching grainy scenes is denoised as if the video began and ended there.
+
+Clean anime mostly measures below 1 and the grainy scenes of openings 3 and more, so 2 is a good start for modern anime. Anime with film grain throughout, such as older cel animation scanned from film, can measure 1.5 to 2.5 from scene to scene. 2 would then denoise some of its scenes and keep the grain in others, so denoise all of it without `--min-grain`, or use 1. Run `analyze` on an episode of a series first to see where its scenes fall. The first read runs at about the speed of `analyze`, and copied scenes take little time, so a mostly clean episode takes a fraction of the time of denoising all of it. As the video is read twice, the input must be a file, and standard input or a pipe is refused with `unsupported_input`.
 
 ### Matching
 
@@ -181,31 +191,75 @@ The CPU is the reference the GPU is tested against, and about 20 times slower.
 
 With `--progress json`, rabbit-denoise writes one JSON object per line to standard output, or to standard error when the video goes to standard output. Every object has an `event` field:
 
-| Event      | When                                 | Fields                                                                                        |
-| ---------- | ------------------------------------ | --------------------------------------------------------------------------------------------- |
-| `start`    | After the y4m header was read        | `width`, `height`, `bit_depth`, `colorspace`, `device`, `total`                               |
-| `progress` | About twice a second                 | `frames` written, `total`, `percent`, `fps` since the start, `elapsed_seconds`, `eta_seconds` |
-| `summary`  | When the command succeeded           | `frames`, `seconds`, `fps`                                                                    |
-| `warning`  | When something of the source is lost | `message`                                                                                     |
-| `error`    | When the command failed              | `code`, `message`                                                                             |
+| Event      | When                                     | Fields                                                                                        |
+| ---------- | ---------------------------------------- | --------------------------------------------------------------------------------------------- |
+| `start`    | After the y4m header was read            | `width`, `height`, `bit_depth`, `colorspace`, `device`, `total`                               |
+| `progress` | About twice a second                     | `frames` written, `total`, `percent`, `fps` since the start, `elapsed_seconds`, `eta_seconds` |
+| `scenes`   | With `--min-grain`, after the first read | `scenes`, `denoised_scenes`, `frames`, `denoised_frames`, `min_grain`                         |
+| `summary`  | When the command succeeded               | `frames`, `seconds`, `fps`, and with `--min-grain` `denoised_frames`                          |
+| `warning`  | When something of the source is lost     | `message`                                                                                     |
+| `error`    | When the command failed                  | `code`, `message`                                                                             |
 
-`device` names the GPU and its backend, or `CPU`. `total` is the frame count the container stores or its duration gives, or the size of a y4m file, and `null` on standard input, where `percent` and `eta_seconds` are `null` too. Errors exit with status 1, or 130 when cancelled, and carry one of these codes:
+With `--min-grain`, the `progress` events of the first read come first, before `scenes` and `start`, and carry `stage` `analyze`. Their `frames` are the frames read. In the denoising read that follows, `frames` counts the copied frames too, so `eta_seconds` reads long while grainy scenes are denoised and short while clean ones are copied. `device` names the GPU and its backend, or `CPU`. `total` is the frame count the container stores or its duration gives, or the size of a y4m file, and `null` on standard input, where `percent` and `eta_seconds` are `null` too. Errors exit with status 1, or 130 when cancelled, and carry one of these codes:
 
-| Code                 | Meaning                                                                                                                            |
-| -------------------- | ---------------------------------------------------------------------------------------------------------------------------------- |
-| `unsupported_input`  | A y4m colorspace rabbit-denoise does not read, a file without a video track, or a variable frame rate for an MKV with other tracks |
-| `unsupported_output` | An output name other than `.mkv`, `.y4m` or none                                                                                   |
-| `bad_input`          | The input is not a video, or a frame could not be read                                                                             |
-| `ffmpeg_missing`     | ffmpeg or ffprobe could not be run                                                                                                 |
-| `ffmpeg_failed`      | ffmpeg failed while decoding the input or writing the MKV                                                                          |
-| `no_frames`          | The input held no frames                                                                                                           |
-| `gpu_unavailable`    | `--device gpu` and no GPU opened, or the settings need more than the GPU filter supports                                           |
-| `gpu_failed`         | The GPU stopped responding or ran out of memory while denoising                                                                    |
-| `io_error`           | A file could not be read, written or moved, the output exists without `-y`, or it is the input                                     |
-| `cancelled`          | Ctrl+C or SIGTERM. A second one ends the process at once                                                                           |
-| `error`              | Anything else                                                                                                                      |
+| Code                 | Meaning                                                                                                                                                                         |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `unsupported_input`  | A y4m colorspace rabbit-denoise does not read, a file without a video track, a variable frame rate for an MKV with other tracks, or `--min-grain` with standard input or a pipe |
+| `unsupported_output` | An output name other than `.mkv`, `.y4m` or none                                                                                                                                |
+| `bad_input`          | The input is not a video, or a frame could not be read                                                                                                                          |
+| `ffmpeg_missing`     | ffmpeg or ffprobe could not be run                                                                                                                                              |
+| `ffmpeg_failed`      | ffmpeg failed while decoding the input or writing the MKV                                                                                                                       |
+| `no_frames`          | The input held no frames                                                                                                                                                        |
+| `gpu_unavailable`    | `--device gpu` and no GPU opened, or the settings need more than the GPU filter supports                                                                                        |
+| `gpu_failed`         | The GPU stopped responding or ran out of memory while denoising                                                                                                                 |
+| `io_error`           | A file could not be read, written or moved, the output exists without `-y`, or it is the input                                                                                  |
+| `cancelled`          | Ctrl+C or SIGTERM. A second one ends the process at once                                                                                                                        |
+| `error`              | Anything else                                                                                                                                                                   |
 
 A cancelled or failed run removes its unfinished output. When Ctrl+C stops both ffmpeg and rabbit-denoise, the end of ffmpeg's stream is not taken for the end of the video. The text of `message` may change between versions. The codes and field names will not.
+
+## Analyzing scenes
+
+```sh
+rabbit-denoise analyze episode.mkv
+rabbit-denoise analyze episode.mkv --progress json > scenes.jsonl
+```
+
+`analyze` splits a video into scenes and measures the grain of each, without denoising. It reads the same inputs as `denoise` and takes `--ffmpeg`. It runs on the CPU at 80 to 90 fps at 1080p on a Ryzen 7 7840HS, so a 24 minute episode takes about 7 minutes. Use it to find the scenes worth denoising, such as a grainy opening in an otherwise clean anime episode.
+
+The grain is the deviation of the luma grain in 8 bit code values, whatever the source's bit depth. It is measured two ways and the smaller is taken, as the denoiser does. Single frames are measured in the flatter half of the blocks at each brightness, which fine texture such as hatching or water reads high in. Pairs of frames are measured where blocks of the first are found again in the second, matched on the frames blurred 3x3, which motion reads high in. Grain differs from frame to frame and texture does not, so a still texture reads low between frames. A texture that also moves faster than the 6 samples a block is searched can still read high. A scene without enough measurable blocks, such as a black screen, has no value. Typical values:
+
+| Source                                                    | Grain      |
+| --------------------------------------------------------- | ---------- |
+| Clean anime, from Blu-ray, DVD or web                     | below 1    |
+| Grainy openings, endings and effects in anime             | 3 and more |
+| Anime with film grain throughout, such as older cel anime | 1.5 to 2.5 |
+| Film with heavy grain                                     | 3 and more |
+
+A dark scene with fast motion, such as a flock of birds, can read high, as motion faster than the search can read as grain.
+
+Scenes start where the picture jumps. Frames are averaged over 8x8 blocks, which takes most grain out, and a frame starts a scene where the mean difference to the frame before jumps by 10 per cent of the code value range or more, the same score as ffmpeg's `scdet` with its default threshold. Motion changes the difference steadily and does not start scenes. A slow fade usually does not either, and a flash can start a scene of one or two frames.
+
+As text, each scene goes to standard output as a line, with progress on standard error:
+
+```
+ Scene           Frames         Start     Length   Grain       Chroma
+     1             0-30   0:00:00.000     1.293s    0.72   0.73  0.57
+     2            31-81   0:00:01.293     2.127s    0.68   2.14  1.14
+     3           82-131   0:00:03.420     2.085s    0.60   1.82  1.03
+```
+
+`-` marks a scene without a value. Standard output may be closed early, as by `| head`, which ends `analyze` without an error.
+
+With `--progress json`, every line on standard output is a JSON object, with these events besides `progress`, `warning` and `error` as above:
+
+| Event     | When                          | Fields                                                                                                                          |
+| --------- | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `start`   | After the y4m header was read | `width`, `height`, `bit_depth`, `colorspace`, `fps`, `total`                                                                    |
+| `scene`   | When a scene ends             | `index` from 0, `first_frame`, `last_frame`, `frames`, `start_seconds`, `end_seconds`, `grain`, `chroma_grain`, `grain_by_band` |
+| `summary` | When the command succeeded    | `frames`, `scenes`, `seconds`, `fps`                                                                                            |
+
+`end_seconds` is where the scene's last frame ends, so it is the next scene's `start_seconds`. Times are frame numbers over the frame rate. A source with a variable frame rate gets a `warning`, as its times drift, and its frame numbers stay exact. `grain` is `null` for a scene without enough measurable blocks. `chroma_grain` holds the Cb and Cr grain the same way, and is `null` for greyscale. `grain_by_band` holds the luma grain of the 16 brightness bands from black to white, with `null` for bands with too few blocks.
 
 ## How it works
 

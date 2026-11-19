@@ -1,6 +1,8 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
-use rabbit_denoise::noise::NoiseModel;
+use rabbit_denoise::dct::Transforms;
+use rabbit_denoise::noise::{GrainTally, NoiseModel, NoiseStats};
+use rabbit_denoise::scenes::{CutDetector, blur};
 use rabbit_denoise::{Denoiser, Device, Frame, FrameModels, Measured, Plane, Settings};
 use serde_json::{Value, json};
 use std::fmt::{self, Display};
@@ -15,6 +17,15 @@ mod ffmpeg;
 static CANCELLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 // Whether a progress line is on the terminal, unfinished.
 static PROGRESS_SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+// Whether standard output was closed, as by `| head`, so nothing more can be printed.
+static STDOUT_CLOSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Prints a line to standard output, or notes that it was closed instead of panicking.
+fn print_line(line: impl Display) {
+  if writeln!(std::io::stdout().lock(), "{line}").is_err() {
+    STDOUT_CLOSED.store(true, std::sync::atomic::Ordering::Relaxed);
+  }
+}
 
 // The first Ctrl+C or SIGTERM stops the denoiser cleanly. A second one ends the process.
 fn install_cancel() {
@@ -114,6 +125,15 @@ enum Command {
     /// About twice as fast and about 2 dB worse.
     #[arg(long, help_heading = "Strength")]
     basic: bool,
+    /// Denoise only the scenes whose grain reaches this, and copy the others unchanged
+    ///
+    /// The grain as `analyze` measures it: the deviation of the luma grain in 8 bit code
+    /// values. The video is read twice, first to find its scenes and measure them, so the
+    /// input must be a file. Clean anime mostly measures below 1 and grainy openings 3 and
+    /// more, so 2 denoises only their grainy scenes. Anime with film grain throughout can
+    /// measure 1.5 to 2.5, which 2 splits scene by scene: denoise all of it instead, or use 1.
+    #[arg(long, help_heading = "Scenes")]
+    min_grain: Option<f32>,
 
     /// Distance between reference patches, in samples
     ///
@@ -203,6 +223,22 @@ enum Command {
     #[arg(long, help_heading = "Diagnostics")]
     timing: bool,
   },
+  /// Find a video's scenes and measure the grain of each, without denoising
+  ///
+  /// Prints every scene with its first and last frame, its times and its grain: the
+  /// deviation of the luma grain in 8 bit code values, whatever the bit depth. Clean anime
+  /// mostly measures below 1, grainy openings 3 and more, and anime with film grain
+  /// throughout 1.5 to 2.5. The grain is
+  /// measured on single frames and between frames, and the smaller is taken, as texture
+  /// reads high in the first and motion in the second.
+  Analyze {
+    /// Video to analyze, or - for y4m on standard input
+    #[arg(default_value = "-")]
+    input: PathBuf,
+    /// ffmpeg executable for files other than y4m, ffprobe is expected next to it
+    #[arg(long, default_value = "ffmpeg")]
+    ffmpeg: String,
+  },
   /// Print a shell completion script
   Completions {
     /// Shell to print the script for
@@ -241,8 +277,9 @@ enum Limit {
 
 /// Every numeric option of `denoise` with its limits, which parsing enforces and --help
 /// shows. The whole number limits are what the GPU filter runs.
-const LIMITS: [(&str, Limit); 15] = [
+const LIMITS: [(&str, Limit); 16] = [
   ("sigma_scale", Limit::Fraction(0.25, 4.0)),
+  ("min_grain", Limit::Fraction(0.1, 50.0)),
   ("chroma_scale", Limit::Fraction(0.25, 4.0)),
   ("lambda", Limit::Fraction(1.0, 6.0)),
   ("step", Limit::Whole(1, 6)),
@@ -360,7 +397,7 @@ impl Reporter {
     if self.json_to_stderr {
       eprintln!("{object}");
     } else {
-      println!("{object}");
+      print_line(object);
     }
   }
 
@@ -411,6 +448,78 @@ struct Job {
   settings: Settings,
   show_spectrum: Option<usize>,
   overwrite: bool,
+  min_grain: Option<f32>,
+}
+
+/// The frames `--min-grain` denoises: runs of touching scenes whose grain reaches the
+/// threshold, as first and last frames, in order.
+#[derive(Clone)]
+struct Plan {
+  runs: Vec<(usize, usize)>,
+  /// The frames the scan read. Frames past them follow the last one.
+  frames: usize,
+}
+
+impl Plan {
+  fn denoises(&self, index: usize) -> bool {
+    let index = index.min(self.frames.saturating_sub(1));
+    let i = self.runs.partition_point(|r| r.1 < index);
+    i < self.runs.len() && self.runs[i].0 <= index
+  }
+
+  fn denoised_frames(&self) -> usize {
+    self.runs.iter().map(|r| r.1 + 1 - r.0).sum()
+  }
+}
+
+/// What the reader hands the denoiser: a frame to denoise with its grain measured, or one
+/// to copy.
+enum Item {
+  Denoise(Measured),
+  Keep(Frame),
+}
+
+/// Scans the video for `--min-grain` and returns the frames to denoise.
+fn plan(job: &Job, min_grain: f32, reporter: &Reporter) -> Result<Plan> {
+  let start = Instant::now();
+  if reporter.text() {
+    eprintln!("Finding the scenes with grain {min_grain} or more");
+  }
+  let (mut runs, mut scenes, mut chosen) = (Vec::<(usize, usize)>::new(), 0usize, 0usize);
+  let frames = scan(
+    &job.input,
+    &job.ffmpeg,
+    reporter,
+    Some("analyze"),
+    |_| Ok(()),
+    |scene, format, _| {
+      scenes += 1;
+      // A scene without enough measurable blocks, such as a black screen, has no grain.
+      if !scene.luma().deviation(format.maxval).is_some_and(|g| g >= min_grain) {
+        return;
+      }
+      chosen += 1;
+      match runs.last_mut() {
+        Some(run) if run.1 + 1 == scene.first => run.1 = scene.last,
+        _ => runs.push((scene.first, scene.last)),
+      }
+    },
+  )?
+  .expect("a scan with a stage does not stop");
+  let plan = Plan { runs, frames };
+  let denoised = plan.denoised_frames();
+  let percent = denoised as f64 * 100.0 / frames as f64;
+  if reporter.text() {
+    eprintln!(
+      "Found {scenes} scenes in {:.1} s. Denoising {chosen} of them, {denoised} of {frames} frames ({percent:.0}%), and copying the rest",
+      start.elapsed().as_secs_f64()
+    );
+  }
+  reporter.event(
+    "scenes",
+    json!({ "scenes": scenes, "denoised_scenes": chosen, "frames": frames, "denoised_frames": denoised, "min_grain": min_grain }),
+  );
+  Ok(plan)
 }
 
 /// What the output is written as.
@@ -464,6 +573,130 @@ fn warn(reporter: &Reporter, message: &str) {
   reporter.event("warning", json!({ "message": message }));
 }
 
+/// A video on its way in as y4m: from a y4m file, standard input or a decoding ffmpeg.
+struct Input {
+  decoding: Option<ffmpeg::Process>,
+  /// What ffprobe found, for files ffmpeg decodes.
+  source: Option<ffmpeg::Source>,
+  reader: Box<dyn Read + Send>,
+}
+
+/// Opens the input, starting ffmpeg for files other than y4m. Interlaced files are refused.
+fn open_input(path: &std::path::Path, ffmpeg: &str) -> Result<Input> {
+  if is_stdio(path) {
+    return Ok(Input {
+      decoding: None,
+      source: None,
+      reader: Box::new(std::io::stdin()),
+    });
+  }
+  if ffmpeg::is_y4m(path)? {
+    let file = std::fs::File::open(path).map_err(|e| fail("io_error", format!("could not open {}: {e}", path.display())))?;
+    return Ok(Input {
+      decoding: None,
+      source: None,
+      reader: Box::new(file),
+    });
+  }
+  let probed = ffmpeg::probe(&ffmpeg::ffprobe_path(ffmpeg), path)?;
+  if let Some(order) = &probed.interlaced {
+    return Err(interlaced(path, order));
+  }
+  let (process, stdout) = ffmpeg::decode(ffmpeg, &probed)?;
+  Ok(Input {
+    decoding: Some(process),
+    source: Some(probed),
+    reader: Box::new(stdout),
+  })
+}
+
+/// The picture format of a y4m stream.
+#[derive(Clone, Copy)]
+struct Format {
+  width: usize,
+  height: usize,
+  colorspace: Colorspace,
+  bit_depth: usize,
+  /// Two bytes per sample.
+  wide: bool,
+  maxval: f32,
+  /// The chroma planes' size, or None for monochrome.
+  chroma: Option<(usize, usize)>,
+}
+
+impl Format {
+  /// The planes of a y4m frame.
+  fn frame(&self, frame: &y4m::Frame) -> Frame {
+    let mut planes = vec![to_plane(frame.get_y_plane(), self.width, self.height, self.wide)];
+    if let Some((cw, ch)) = self.chroma {
+      planes.push(to_plane(frame.get_u_plane(), cw, ch, self.wide));
+      planes.push(to_plane(frame.get_v_plane(), cw, ch, self.wide));
+    }
+    Frame { planes }
+  }
+
+  /// The frame count, for the percent done and the time left: from ffprobe, or a y4m file's size.
+  fn total(&self, source: Option<&ffmpeg::Source>, path: &std::path::Path) -> Option<u64> {
+    match source {
+      Some(source) => source.frames,
+      None if !is_stdio(path) => {
+        let samples = self.width * self.height + self.chroma.map_or(0, |(w, h)| 2 * w * h);
+        let frame_bytes = (6 + samples * self.colorspace.get_bytes_per_sample()) as u64;
+        std::fs::metadata(path).ok().filter(|m| m.is_file()).map(|m| m.len() / frame_bytes)
+      }
+      None => None,
+    }
+  }
+}
+
+type Decoder = y4m::Decoder<BufReader<Box<dyn Read + Send>>>;
+
+/// Reads the y4m header and returns the decoder, the header's text and the format.
+/// Interlaced streams are refused.
+fn read_header(
+  reader: Box<dyn Read + Send>,
+  decoding: &mut Option<ffmpeg::Process>,
+  path: &std::path::Path,
+) -> Result<(Decoder, String, Format)> {
+  let decoded = y4m::decode(BufReader::with_capacity(1 << 20, reader));
+  // An empty stream from ffmpeg is ffmpeg's failure.
+  if let (Err(_), Some(decoding)) = (&decoded, decoding.as_mut()) {
+    check_cancel()?;
+    decoding.finish()?;
+  }
+  let decoder = decoded.map_err(|e| match e {
+    y4m::Error::UnknownColorspace => fail(
+      "unsupported_input",
+      "unsupported y4m colorspace: rabbit-denoise reads 8, 10 and 12 bit 4:2:0, 4:2:2 and 4:4:4, and 8 and 12 bit greyscale. Convert other formats with ffmpeg -pix_fmt, such as gray12le for 10 bit greyscale",
+    ),
+    e => fail("bad_input", format!("not a y4m stream: {e:?}")),
+  })?;
+  let header = String::from_utf8_lossy(decoder.get_raw_params()).into_owned();
+  // y4m names the field order t, b or m, ffprobe tt, bb or mixed.
+  let order = header.split_whitespace().find_map(|t| t.strip_prefix('I')).and_then(|o| match o {
+    "t" => Some("tt"),
+    "b" => Some("bb"),
+    "m" => Some("mixed"),
+    _ => None,
+  });
+  if let Some(order) = order {
+    return Err(interlaced(path, order));
+  }
+  let (width, height) = (decoder.get_width(), decoder.get_height());
+  let colorspace = decoder.get_colorspace();
+  let bit_depth = colorspace.get_bit_depth();
+  let format = Format {
+    width,
+    height,
+    colorspace,
+    bit_depth,
+    wide: colorspace.get_bytes_per_sample() == 2,
+    maxval: ((1u32 << bit_depth) - 1) as f32,
+    chroma: chroma_size(colorspace, width, height)?,
+  };
+  Ok((decoder, header, format))
+}
+
 fn denoise(job: Job, reporter: &Reporter) -> Result<()> {
   let kind = output_kind(&job.output)?;
   if !is_stdio(&job.output) && std::fs::metadata(&job.output).is_ok_and(|m| m.is_file()) && !job.overwrite {
@@ -482,25 +715,21 @@ fn denoise(job: Job, reporter: &Reporter) -> Result<()> {
       format!("{} is the input, choose another output", job.output.display()),
     ));
   }
+  // Standard input, pipes and devices cannot be read a second time.
+  if job.min_grain.is_some() && !(!is_stdio(&job.input) && std::fs::metadata(&job.input).is_ok_and(|m| m.is_file())) {
+    return Err(fail(
+      "unsupported_input",
+      "--min-grain reads the video twice, so the input must be a file, not standard input or a pipe",
+    ));
+  }
   let ffprobe = ffmpeg::ffprobe_path(&job.ffmpeg);
 
   // Frames are read and written on their own threads. Files other than y4m come through ffmpeg.
-  let mut decoding = None;
-  let mut source = None;
-  let input: Box<dyn Read + Send> = if is_stdio(&job.input) {
-    Box::new(std::io::stdin())
-  } else if ffmpeg::is_y4m(&job.input)? {
-    Box::new(std::fs::File::open(&job.input).map_err(|e| fail("io_error", format!("could not open {}: {e}", job.input.display())))?)
-  } else {
-    let probed = ffmpeg::probe(&ffprobe, &job.input)?;
-    if let Some(order) = &probed.interlaced {
-      return Err(interlaced(&job.input, order));
-    }
-    let (process, stdout) = ffmpeg::decode(&job.ffmpeg, &probed)?;
-    decoding = Some(process);
-    source = Some(probed);
-    Box::new(stdout)
-  };
+  let Input {
+    mut decoding,
+    source,
+    reader,
+  } = open_input(&job.input, &job.ffmpeg)?;
 
   // An MKV takes the source's other tracks unless asked not to, which a variable frame
   // rate would put out of sync, and its HDR metadata.
@@ -528,49 +757,24 @@ fn denoise(job: Job, reporter: &Reporter) -> Result<()> {
     }
   }
 
-  let decoded = y4m::decode(BufReader::with_capacity(1 << 20, input));
-  // An empty stream from ffmpeg is ffmpeg's failure.
-  if let (Err(_), Some(decoding)) = (&decoded, decoding.as_mut()) {
-    check_cancel()?;
-    decoding.finish()?;
-  }
-  let mut decoder = decoded.map_err(|e| match e {
-    y4m::Error::UnknownColorspace => fail(
-      "unsupported_input",
-      "unsupported y4m colorspace: rabbit-denoise reads 8, 10 and 12 bit 4:2:0, 4:2:2 and 4:4:4, and 8 and 12 bit greyscale. Convert other formats with ffmpeg -pix_fmt, such as gray12le for 10 bit greyscale",
-    ),
-    e => fail("bad_input", format!("not a y4m stream: {e:?}")),
-  })?;
-  let header = String::from_utf8_lossy(decoder.get_raw_params()).into_owned();
-  // y4m names the field order t, b or m, ffprobe tt, bb or mixed.
-  let order = header.split_whitespace().find_map(|t| t.strip_prefix('I')).and_then(|o| match o {
-    "t" => Some("tt"),
-    "b" => Some("bb"),
-    "m" => Some("mixed"),
-    _ => None,
-  });
-  if let Some(order) = order {
-    return Err(interlaced(&job.input, order));
-  }
-  let (width, height) = (decoder.get_width(), decoder.get_height());
-  let colorspace = decoder.get_colorspace();
-  let bit_depth = colorspace.get_bit_depth();
-  let wide = colorspace.get_bytes_per_sample() == 2;
-  let maxval = ((1u32 << bit_depth) - 1) as f32;
-  let chroma = chroma_size(colorspace, width, height)?;
-  // The frame count, for the percent done and the time left: from ffprobe, or a y4m file's size.
-  let total = match &source {
-    Some(source) => source.frames,
-    None if !is_stdio(&job.input) => {
-      let samples = width * height + chroma.map_or(0, |(w, h)| 2 * w * h);
-      let frame_bytes = (6 + samples * colorspace.get_bytes_per_sample()) as u64;
-      std::fs::metadata(&job.input)
-        .ok()
-        .filter(|m| m.is_file())
-        .map(|m| m.len() / frame_bytes)
-    }
+  let (mut decoder, header, format) = read_header(reader, &mut decoding, &job.input)?;
+  let total = format.total(source.as_ref(), &job.input);
+  let Format {
+    width,
+    height,
+    colorspace,
+    bit_depth,
+    wide,
+    maxval,
+    ..
+  } = format;
+  // The scan runs once the checks above have passed, before any output exists. The second
+  // ffmpeg waits meanwhile.
+  let plan = match job.min_grain {
+    Some(min_grain) => Some(plan(&job, min_grain, reporter)?),
     None => None,
   };
+  check_cancel()?;
 
   // Files are written under a temporary name so a failed run leaves nothing that looks
   // finished. Devices and pipes are written directly.
@@ -704,9 +908,10 @@ fn denoise(job: Job, reporter: &Reporter) -> Result<()> {
   // One thread reads frames ahead of the denoiser and another writes them behind it.
   let (mut read, mut written) = (0usize, 0usize);
   std::thread::scope(|scope| -> Result<()> {
-    // The reader also measures each frame's grain on its own.
-    let (frames_in, frames) = std::sync::mpsc::sync_channel::<Result<Measured>>(2);
+    // The reader also measures the grain of each frame to denoise on its own.
+    let (frames_in, frames) = std::sync::mpsc::sync_channel::<Result<Item>>(2);
     let measurer = denoiser.measurer();
+    let reader_plan = plan.clone();
     scope.spawn(move || {
       for index in 0.. {
         let frame = match decoder.read_frame() {
@@ -717,12 +922,13 @@ fn denoise(job: Job, reporter: &Reporter) -> Result<()> {
             return;
           }
         };
-        let mut planes = vec![to_plane(frame.get_y_plane(), width, height, wide)];
-        if let Some((cw, ch)) = chroma {
-          planes.push(to_plane(frame.get_u_plane(), cw, ch, wide));
-          planes.push(to_plane(frame.get_v_plane(), cw, ch, wide));
-        }
-        if frames_in.send(Ok(measurer.measure(Frame { planes }))).is_err() {
+        let frame = format.frame(&frame);
+        let item = if reader_plan.as_ref().is_none_or(|p| p.denoises(index)) {
+          Item::Denoise(measurer.measure(frame))
+        } else {
+          Item::Keep(frame)
+        };
+        if frames_in.send(Ok(item)).is_err() {
           return;
         }
       }
@@ -751,23 +957,48 @@ fn denoise(job: Job, reporter: &Reporter) -> Result<()> {
       Ok(frames.is_empty() || done_out.send(frames).is_ok())
     };
     let mut running = true;
-    for frame in frames {
+    // Whether the denoiser takes frames, and how many were copied since its last run ended.
+    // Each run of frames to denoise starts the denoiser afresh, so its frame numbers stay
+    // those of the video.
+    let (mut open, mut skipped) = (true, 0usize);
+    for item in frames {
       check_cancel()?;
-      let frame = match frame {
-        Ok(frame) => frame,
+      let item = match item {
+        Ok(item) => item,
         // A frame cut short is ffmpeg's failure when it has stopped.
         Err(e) => return Err(decoding.as_mut().and_then(|d| d.failed(Duration::ZERO)).unwrap_or(e)),
       };
-      let done = denoiser.push_measured(frame).map_err(|e| fail("gpu_failed", format!("{e:#}")))?;
       read += 1;
-      show_noise(&mut denoiser);
+      let done = match item {
+        Item::Denoise(frame) => {
+          if !open {
+            denoiser.resume(skipped);
+            (open, skipped) = (true, 0);
+          }
+          let done = denoiser.push_measured(frame).map_err(|e| fail("gpu_failed", format!("{e:#}")))?;
+          show_noise(&mut denoiser);
+          done
+        }
+        Item::Keep(frame) => {
+          // The run before goes out first, so the frames stay in order.
+          let mut done = Vec::new();
+          if open {
+            done = denoiser.finish().map_err(|e| fail("gpu_failed", format!("{e:#}")))?;
+            show_noise(&mut denoiser);
+            open = false;
+          }
+          skipped += 1;
+          done.push(frame);
+          done
+        }
+      };
       if !write(done, &mut written)? {
         running = false;
         break;
       }
       progress(written, false);
     }
-    if running {
+    if running && open {
       check_cancel()?;
       let done = denoiser.finish().map_err(|e| fail("gpu_failed", format!("{e:#}")))?;
       show_noise(&mut denoiser);
@@ -804,9 +1035,12 @@ fn denoise(job: Job, reporter: &Reporter) -> Result<()> {
     part.0 = None;
   }
   let seconds = start.elapsed().as_secs_f64();
+  // With --min-grain, the frames planned past the end of the video are not counted.
+  let denoised = plan.as_ref().map(|p| (0..written).filter(|&i| p.denoises(i)).count());
   if reporter.text() {
+    let copied = denoised.map_or(String::new(), |d| format!(", {} of them copied unchanged", written - d));
     eprintln!(
-      "\rDenoised {written} frames in {seconds:.1} s, {:.2} fps   ",
+      "\rDenoised {written} frames in {seconds:.1} s, {:.2} fps{copied}   ",
       written as f64 / seconds
     );
     PROGRESS_SHOWN.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -814,9 +1048,321 @@ fn denoise(job: Job, reporter: &Reporter) -> Result<()> {
   if job.settings.timing {
     eprintln!("{}", denoiser.timing_report());
   }
+  let mut fields = json!({ "frames": written, "seconds": seconds, "fps": written as f64 / seconds });
+  if let Some(denoised) = denoised {
+    fields["denoised_frames"] = json!(denoised);
+  }
+  reporter.event("summary", fields);
+  Ok(())
+}
+
+/// A scene found by `scan`, its frames and their grain.
+struct Scene {
+  first: usize,
+  last: usize,
+  /// One tally per plane, measured on single frames.
+  tallies: Vec<GrainTally>,
+  /// The luma grain measured between the scene's frames.
+  pairs: GrainTally,
+}
+
+impl Scene {
+  /// The luma grain: measured on single frames, capped by the grain measured between them.
+  fn luma(&self) -> GrainTally {
+    self.tallies[0].capped(&self.pairs)
+  }
+}
+
+/// Rounds for printing in JSON, where f32 values would show their binary noise.
+fn rounded(value: f64, places: i32) -> f64 {
+  let scale = 10f64.powi(places);
+  (value * scale).round() / scale
+}
+
+fn clock(seconds: f64) -> String {
+  let millis = (seconds * 1000.0).round() as u64;
+  format!(
+    "{}:{:02}:{:02}.{:03}",
+    millis / 3_600_000,
+    millis / 60_000 % 60,
+    millis / 1000 % 60,
+    millis % 1000
+  )
+}
+
+/// Clears an unfinished progress line on the terminal.
+fn clear_progress() {
+  if PROGRESS_SHOWN.swap(false, std::sync::atomic::Ordering::Relaxed) {
+    eprint!("\r{:79}\r", "");
+  }
+}
+
+/// What `scan` knows once the y4m header is read.
+struct Scanning<'a> {
+  format: Format,
+  fps: f64,
+  total: Option<u64>,
+  source: Option<&'a ffmpeg::Source>,
+}
+
+/// Reads a whole video, splits it into scenes and measures the grain of each on single
+/// frames. `started` runs once the header is read and `scene` as each scene ends.
+/// `progress` events carry `stage` when it is given. Without a stage, as for `analyze`, the
+/// scan stops when standard output is closed and returns None. Otherwise it returns the
+/// frames read.
+fn scan(
+  path: &std::path::Path,
+  ffmpeg: &str,
+  reporter: &Reporter,
+  stage: Option<&str>,
+  started: impl FnOnce(&Scanning) -> Result<()>,
+  mut scene: impl FnMut(&Scene, &Format, f64),
+) -> Result<Option<usize>> {
+  let Input {
+    mut decoding,
+    source,
+    reader,
+  } = open_input(path, ffmpeg)?;
+  let (mut decoder, _, format) = read_header(reader, &mut decoding, path)?;
+  let total = format.total(source.as_ref(), path);
+  let rate = decoder.get_framerate();
+  let fps = if rate.den > 0 && rate.num > 0 {
+    rate.num as f64 / rate.den as f64
+  } else {
+    24.0
+  };
+  started(&Scanning {
+    format,
+    fps,
+    total,
+    source: source.as_ref(),
+  })?;
+
+  let stderr_terminal = std::io::IsTerminal::is_terminal(&std::io::stderr());
+  let start = Instant::now();
+  let mut last_report = Instant::now();
+  let mut progress = |frames: usize, last: bool| {
+    if !last && last_report.elapsed().as_secs_f64() < 0.5 {
+      return;
+    }
+    last_report = Instant::now();
+    let elapsed = start.elapsed().as_secs_f64();
+    let rate = frames as f64 / elapsed.max(1e-9);
+    let total = total.map(|t| t.max(frames as u64));
+    let percent = total.map(|t| (frames as f64 * 100.0 / t.max(1) as f64).min(100.0));
+    let eta = total
+      .filter(|_| rate > 0.0 && frames > 0)
+      .map(|t| ((t - frames as u64) as f64 / rate).round() as u64);
+    if reporter.text() && stderr_terminal && !last {
+      let done = match total {
+        Some(total) => format!("{frames}/{total} frames ({:.0}%)", percent.unwrap_or(0.0)),
+        None => format!("{frames} frames"),
+      };
+      let left = eta.map_or_else(String::new, |s| format!(", eta {}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60));
+      eprint!("\rAnalyzed {done}, {rate:.2} fps{left}   ");
+      PROGRESS_SHOWN.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    let mut fields =
+      json!({ "frames": frames, "total": total, "percent": percent, "fps": rate, "elapsed_seconds": elapsed, "eta_seconds": eta });
+    if let Some(stage) = stage {
+      fields["stage"] = json!(stage);
+    }
+    reporter.event("progress", fields);
+  };
+
+  let mut read = 0usize;
+  let stopped = std::thread::scope(|scope| -> Result<bool> {
+    // The reader decodes and measures, as measuring a frame does not need the one before.
+    let (frames_in, frames) = std::sync::mpsc::sync_channel::<Result<(bool, Vec<NoiseStats>, Option<NoiseStats>)>>(4);
+    scope.spawn(move || {
+      let transforms = Transforms::new(1);
+      let mut cuts = CutDetector::new(format.maxval);
+      // The first frame of a pair: its luma, and blurred to match blocks on.
+      let mut previous: Option<(Plane, Plane)> = None;
+      for index in 0.. {
+        let frame = match decoder.read_frame() {
+          Ok(frame) => frame,
+          Err(y4m::Error::EOF) => return,
+          Err(e) => {
+            let _ = frames_in.send(Err(fail("bad_input", format!("could not read frame {index}: {e:?}"))));
+            return;
+          }
+        };
+        let frame = format.frame(&frame);
+        let cut = cuts.is_cut(&frame.planes[0]);
+        // Grain is measured between frames 0 and 1, 2 and 3, and so on, which is enough and
+        // takes half the time of every pair. A pair across a cut measures nothing useful.
+        let (stats, pair) = rayon::join(
+          || -> Vec<NoiseStats> {
+            frame
+              .planes
+              .iter()
+              .map(|p| NoiseStats::measure(p, format.maxval, &transforms))
+              .collect()
+          },
+          || {
+            let blurred = blur(&frame.planes[0]);
+            match previous.take() {
+              Some((luma_a, blurred_a)) if !cut => {
+                let blocks = NoiseStats::pair_blocks(&luma_a, &blurred_a, &frame.planes[0], &blurred, None, &transforms);
+                (Some(NoiseStats::from_pairs(&blocks, false, format.maxval)), None)
+              }
+              _ => (None, Some(blurred)),
+            }
+          },
+        );
+        let (pair, blurred) = pair;
+        // The first frame of the next pair keeps its luma and blur.
+        if let Some(blurred) = blurred {
+          previous = Some((frame.planes.into_iter().next().expect("luma"), blurred));
+        }
+        if frames_in.send(Ok((cut, stats, pair))).is_err() {
+          return;
+        }
+      }
+    });
+    let mut current: Option<Scene> = None;
+    for measured in frames {
+      check_cancel()?;
+      // Nobody reads the scenes any more, as after `| head`.
+      if stage.is_none() && STDOUT_CLOSED.load(std::sync::atomic::Ordering::Relaxed) {
+        // Stopping ffmpeg before its pipe closes keeps it from reporting a broken pipe.
+        drop(decoding.take());
+        return Ok(true);
+      }
+      let (cut, stats, pair) = match measured {
+        Ok(measured) => measured,
+        // A frame cut short is ffmpeg's failure when it has stopped.
+        Err(e) => return Err(decoding.as_mut().and_then(|d| d.failed(Duration::ZERO)).unwrap_or(e)),
+      };
+      if cut {
+        if let Some(done) = current.take() {
+          scene(&done, &format, fps);
+        }
+        current = Some(Scene {
+          first: read,
+          last: read,
+          tallies: vec![GrainTally::default(); stats.len()],
+          pairs: GrainTally::default(),
+        });
+      }
+      let open = current.as_mut().expect("the first frame starts a scene");
+      open.last = read;
+      if let Some(pair) = &pair {
+        open.pairs.add(pair);
+      }
+      for (tally, stats) in open.tallies.iter_mut().zip(&stats) {
+        tally.add(stats);
+      }
+      read += 1;
+      progress(read, false);
+    }
+    // Ctrl+C also stops an ffmpeg feeding the input, which then looks like its end.
+    check_cancel()?;
+    if let Some(done) = current.take() {
+      scene(&done, &format, fps);
+    }
+    Ok(false)
+  })?;
+  if stopped {
+    return Ok(None);
+  }
+  if let Some(decoding) = decoding.as_mut() {
+    decoding.finish()?;
+  }
+  if read == 0 {
+    return Err(fail("no_frames", "no frames could be read"));
+  }
+  progress(read, true);
+  if reporter.text() {
+    clear_progress();
+  }
+  Ok(Some(read))
+}
+
+fn analyze(path: PathBuf, ffmpeg: String, reporter: &Reporter) -> Result<()> {
+  let start = Instant::now();
+  let mut shown_header = false;
+  let mut scenes = 0usize;
+  let started = |scanning: &Scanning| -> Result<()> {
+    if let Some(source) = scanning.source
+      && source.is_variable_frame_rate(&ffmpeg::ffprobe_path(&ffmpeg))?
+    {
+      warn(
+        reporter,
+        "the source has a variable frame rate, so scene times assume one frame rate and drift. Frame numbers are exact",
+      );
+    }
+    let Scanning { format, fps, total, .. } = scanning;
+    if reporter.text() {
+      eprintln!(
+        "Analyzing {}x{}, {} bit, {fps:.3} fps",
+        format.width, format.height, format.bit_depth
+      );
+    }
+    reporter.event(
+      "start",
+      json!({ "width": format.width, "height": format.height, "bit_depth": format.bit_depth, "colorspace": format!("{:?}", format.colorspace), "fps": fps, "total": total }),
+    );
+    Ok(())
+  };
+  let report_scene = |scene: &Scene, format: &Format, fps: f64| {
+    let maxval = format.maxval;
+    let luma_tally = scene.luma();
+    let luma = luma_tally.deviation(maxval);
+    let chroma: Option<Vec<Option<f32>>> =
+      (scene.tallies.len() == 3).then(|| scene.tallies[1..].iter().map(|t| t.deviation(maxval)).collect());
+    let (start, end) = (scene.first as f64 / fps, (scene.last + 1) as f64 / fps);
+    let value = |v: Option<f32>| v.map(|v| rounded(v as f64, 3));
+    reporter.event(
+      "scene",
+      json!({
+        "index": scenes,
+        "first_frame": scene.first,
+        "last_frame": scene.last,
+        "frames": scene.last + 1 - scene.first,
+        "start_seconds": rounded(start, 6),
+        "end_seconds": rounded(end, 6),
+        "grain": value(luma),
+        "chroma_grain": chroma.as_ref().map(|c| c.iter().map(|&v| value(v)).collect::<Vec<_>>()),
+        "grain_by_band": luma_tally.bands(maxval).map(value),
+      }),
+    );
+    if reporter.text() {
+      clear_progress();
+      if !shown_header {
+        print_line(format!(
+          "{:>6}  {:>15}  {:>12}  {:>9}  {:>6}  {:>11}",
+          "Scene", "Frames", "Start", "Length", "Grain", "Chroma"
+        ));
+        shown_header = true;
+      }
+      let number = |v: Option<f32>| v.map_or("-".to_string(), |v| format!("{v:.2}"));
+      let chroma = chroma.map_or(String::new(), |c| format!("{:>5} {:>5}", number(c[0]), number(c[1])));
+      print_line(format!(
+        "{:>6}  {:>15}  {:>12}  {:>8.3}s  {:>6}  {chroma:>11}",
+        scenes + 1,
+        format!("{}-{}", scene.first, scene.last),
+        clock(start),
+        end - start,
+        number(luma),
+      ));
+    }
+    scenes += 1;
+  };
+  let Some(read) = scan(&path, &ffmpeg, reporter, None, started, report_scene)? else {
+    return Ok(());
+  };
+  let seconds = start.elapsed().as_secs_f64();
+  if reporter.text() {
+    eprintln!(
+      "Analyzed {read} frames in {seconds:.1} s, {:.2} fps, {scenes} scenes",
+      read as f64 / seconds
+    );
+  }
   reporter.event(
     "summary",
-    json!({ "frames": written, "seconds": seconds, "fps": written as f64 / seconds }),
+    json!({ "frames": read, "scenes": scenes, "seconds": seconds, "fps": read as f64 / seconds }),
   );
   Ok(())
 }
@@ -833,6 +1379,7 @@ fn run(command: Command, reporter: &Reporter) -> Result<()> {
       chroma_scale,
       lambda,
       basic,
+      min_grain,
       step,
       temporal_radius,
       search_radius,
@@ -891,10 +1438,12 @@ fn run(command: Command, reporter: &Reporter) -> Result<()> {
           settings,
           show_spectrum: show_spectrum.map(|b| b as usize),
           overwrite,
+          min_grain,
         },
         reporter,
       )
     }
+    Command::Analyze { input, ffmpeg } => analyze(input, ffmpeg, reporter),
     Command::Completions { shell } => {
       let mut command = cli_command();
       let mut text = Vec::new();
@@ -964,6 +1513,19 @@ mod tests {
         assert_eq!(LIMITS.iter().filter(|(name, _)| *name == id).count(), 1, "{id}");
       }
     }
+  }
+
+  #[test]
+  fn plan_denoises_its_runs_and_frames_past_the_scan_follow_the_last() {
+    let plan = Plan {
+      runs: vec![(3, 5), (9, 9)],
+      frames: 10,
+    };
+    let denoised: Vec<usize> = (0..12).filter(|&i| plan.denoises(i)).collect();
+    assert_eq!(denoised, [3, 4, 5, 9, 10, 11]);
+    assert_eq!(plan.denoised_frames(), 4);
+    let none = Plan { runs: vec![], frames: 4 };
+    assert!(!(0..6).any(|i| none.denoises(i)));
   }
 
   #[test]

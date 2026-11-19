@@ -379,6 +379,70 @@ impl NoiseStats {
   }
 }
 
+/// The grain of many frames' measurements by brightness band, added up as they come so a
+/// scene of any length takes the same memory.
+#[derive(Clone)]
+pub struct GrainTally {
+  /// Per band, the mean variance over the frequencies besides DC, times the blocks it holds for.
+  weighted: [f64; BANDS],
+  blocks: [f64; BANDS],
+}
+
+impl Default for GrainTally {
+  fn default() -> Self {
+    Self {
+      weighted: [0.0; BANDS],
+      blocks: [0.0; BANDS],
+    }
+  }
+}
+
+impl GrainTally {
+  /// Adds one frame's measurement of a plane. DC is left out, as single frames extrapolate it.
+  pub fn add(&mut self, stats: &NoiseStats) {
+    for b in 0..BANDS {
+      let n = stats.blocks[b] as f64;
+      if n > 0.0 {
+        let mean = stats.variance[b][1..].iter().map(|&v| v as f64).sum::<f64>() / (AREA - 1) as f64;
+        self.weighted[b] += mean * n;
+        self.blocks[b] += n;
+      }
+    }
+  }
+
+  /// This tally with every band's grain capped by `other`'s where `other` measured enough
+  /// blocks. Grain measured between frames reads high where the picture moves and single
+  /// frames read high on texture, so the smaller is nearer the grain, as in the denoiser.
+  pub fn capped(&self, other: &GrainTally) -> GrainTally {
+    let mut out = self.clone();
+    for b in 0..BANDS {
+      if self.blocks[b] > 0.0 && other.blocks[b] >= MIN_BLOCKS as f64 {
+        let cap = other.weighted[b] / other.blocks[b];
+        out.weighted[b] = self.weighted[b].min(cap * self.blocks[b]);
+      }
+    }
+    out
+  }
+
+  /// The grain deviation of every band in 8 bit code values, or None where too few blocks
+  /// were measured.
+  pub fn bands(&self, maxval: f32) -> [Option<f32>; BANDS] {
+    let to_8bit = 255.0 / maxval as f64;
+    std::array::from_fn(|b| (self.blocks[b] >= MIN_BLOCKS as f64).then(|| ((self.weighted[b] / self.blocks[b]).sqrt() * to_8bit) as f32))
+  }
+
+  /// The grain deviation in 8 bit code values over the bands with enough blocks, each
+  /// weighted by its block count, or None when no band had enough.
+  pub fn deviation(&self, maxval: f32) -> Option<f32> {
+    let (mut sum, mut count) = (0.0f64, 0.0f64);
+    for b in (0..BANDS).filter(|&b| self.blocks[b] >= MIN_BLOCKS as f64) {
+      sum += self.weighted[b];
+      count += self.blocks[b];
+    }
+    (count > 0.0).then(|| ((sum / count).sqrt() * 255.0 / maxval as f64) as f32)
+  }
+}
+
 /// Caps every frequency of a spectrum at AV1_PEAK times the deviation of its highest
 /// frequencies, those whose horizontal and vertical frequencies add up to 8 or more.
 fn limit_to_av1(spectrum: &mut [f32; AREA]) {
@@ -587,6 +651,50 @@ mod tests {
     model.variance(400.0, &mut spectrum);
     let measured = spectrum[1..].iter().sum::<f32>() / (AREA - 1) as f32;
     assert!((measured / actual - 1.0).abs() < 0.25, "measured {measured}, actual {actual}");
+  }
+
+  #[test]
+  fn tally_reports_the_deviation_in_8_bit_code_values() {
+    let (w, h) = (512, 256);
+    let mut plane = Plane::new(w, h);
+    let mut rng = Rng(5);
+    // 10 bit, grain of 8 code values, which is 2 in 8 bit.
+    for v in plane.data.iter_mut() {
+      *v = 500.0 + 8.0 * rng.gauss();
+    }
+    let t = Transforms::new(1);
+    let mut tally = GrainTally::default();
+    for _ in 0..3 {
+      tally.add(&NoiseStats::measure(&plane, 1023.0, &t));
+    }
+    let deviation = tally.deviation(1023.0).unwrap();
+    assert!((deviation / 2.0 - 1.0).abs() < 0.15, "{deviation}");
+    let bands = tally.bands(1023.0);
+    assert!(bands[band(500.0, 1023.0)].is_some());
+    assert!(bands[0].is_none());
+    assert!(GrainTally::default().deviation(1023.0).is_none());
+  }
+
+  #[test]
+  fn capping_keeps_the_smaller_grain() {
+    let (w, h) = (512, 256);
+    let t = Transforms::new(1);
+    let mut rng = Rng(3);
+    let mut tally = |sigma: f32| {
+      let mut plane = Plane::new(w, h);
+      for v in plane.data.iter_mut() {
+        *v = 500.0 + sigma * rng.gauss();
+      }
+      let mut tally = GrainTally::default();
+      tally.add(&NoiseStats::measure(&plane, 1023.0, &t));
+      tally
+    };
+    let (strong, weak) = (tally(16.0), tally(4.0));
+    let capped = strong.capped(&weak).deviation(1023.0).unwrap();
+    assert!((capped - weak.deviation(1023.0).unwrap()).abs() < 1e-3, "{capped}");
+    let kept = weak.capped(&strong).deviation(1023.0).unwrap();
+    assert!((kept - weak.deviation(1023.0).unwrap()).abs() < 1e-3, "{kept}");
+    assert!(strong.capped(&GrainTally::default()).deviation(1023.0) == strong.deviation(1023.0));
   }
 
   #[test]

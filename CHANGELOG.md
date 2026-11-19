@@ -2,6 +2,12 @@
 
 Error codes and JSON field names stay compatible within a major version. Messages meant for people may change in any release. Before 1.0, a minor version may change the defaults and the options.
 
+## 0.1.9 - 2026-11-19
+
+### Features
+
+- `denoise --denoise-frames <RANGES>` denoises only the frames given, such as `0-299,515-1265`, and copies the others unchanged. It is for programs that choose the scenes themselves, for example from `analyze`, so the video is read once and standard input works too. Every run of touching frames is denoised as if the video began and ended there, as with `--min-grain`. `summary` gives `denoised_frames`.
+
 ## 0.1.8 - 2026-11-19
 
 ### Features

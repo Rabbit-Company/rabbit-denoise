@@ -127,13 +127,22 @@ enum Command {
     basic: bool,
     /// Denoise only the scenes whose grain reaches this, and copy the others unchanged
     ///
-    /// The grain as `analyze` measures it: the deviation of the luma grain in 8 bit code
-    /// values. The video is read twice, first to find its scenes and measure them, so the
-    /// input must be a file. Clean anime mostly measures below 1 and grainy openings 3 and
-    /// more, so 2 denoises only their grainy scenes. Anime with film grain throughout can
-    /// measure 1.5 to 2.5, which 2 splits scene by scene: denoise all of it instead, or use 1.
+    /// The grain as `analyze` measures it: the deviation of the luma grain on a 0 to 255
+    /// scale, whatever the bit depth. The video is read twice, first to find its scenes and
+    /// measure them, so the input must be a file. Clean anime mostly measures below 1 and
+    /// grainy openings 3 and more, so 2 denoises only their grainy scenes. Anime with film
+    /// grain throughout can measure 1.5 to 2.5, which 2 splits scene by scene: denoise all of
+    /// it instead, or use 1.
     #[arg(long, help_heading = "Scenes")]
     min_grain: Option<f32>,
+    /// Denoise only these frames, and copy the others unchanged
+    ///
+    /// First and last frames, counted from 0, such as 0-299,515-1265, or single frames such
+    /// as 42. Each run of touching frames is denoised as if the video began and ended there.
+    /// Made for a program that chose the scenes itself, such as from what `analyze` printed,
+    /// so the video is read once and standard input works too.
+    #[arg(long, value_name = "RANGES", value_parser = parse_frame_ranges, conflicts_with = "min_grain", help_heading = "Scenes")]
+    denoise_frames: Option<FrameRanges>,
 
     /// Distance between reference patches, in samples
     ///
@@ -226,7 +235,7 @@ enum Command {
   /// Find a video's scenes and measure the grain of each, without denoising
   ///
   /// Prints every scene with its first and last frame, its times and its grain: the
-  /// deviation of the luma grain in 8 bit code values, whatever the bit depth. Clean anime
+  /// deviation of the luma grain on a 0 to 255 scale, whatever the bit depth. Clean anime
   /// mostly measures below 1, grainy openings 3 and more, and anime with film grain
   /// throughout 1.5 to 2.5. The grain is
   /// measured on single frames and between frames, and the smaller is taken, as texture
@@ -449,10 +458,48 @@ struct Job {
   show_spectrum: Option<usize>,
   overwrite: bool,
   min_grain: Option<f32>,
+  denoise_frames: Option<FrameRanges>,
 }
 
-/// The frames `--min-grain` denoises: runs of touching scenes whose grain reaches the
-/// threshold, as first and last frames, in order.
+/// Frames to denoise, as first and last frames: sorted, with touching and overlapping
+/// ranges joined.
+#[derive(Clone, Debug, PartialEq)]
+struct FrameRanges(Vec<(usize, usize)>);
+
+/// Reads ranges such as `0-299,515-1265,2000`.
+fn parse_frame_ranges(text: &str) -> std::result::Result<FrameRanges, String> {
+  let mut ranges = Vec::new();
+  for part in text.split(',').map(str::trim) {
+    let number = |s: &str| {
+      s.trim()
+        .parse::<usize>()
+        .map_err(|_| format!("{part} is not a frame or a range of frames such as 0-299"))
+    };
+    let (first, last) = match part.split_once('-') {
+      Some((a, b)) => (number(a)?, number(b)?),
+      None => {
+        let frame = number(part)?;
+        (frame, frame)
+      }
+    };
+    if first > last {
+      return Err(format!("{part} ends before it starts"));
+    }
+    ranges.push((first, last));
+  }
+  ranges.sort_unstable();
+  let mut joined: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+  for (first, last) in ranges {
+    match joined.last_mut() {
+      Some(previous) if first <= previous.1.saturating_add(1) => previous.1 = previous.1.max(last),
+      _ => joined.push((first, last)),
+    }
+  }
+  Ok(FrameRanges(joined))
+}
+
+/// The frames `--min-grain` or `--denoise-frames` denoises, as first and last frames of
+/// runs, in order.
 #[derive(Clone)]
 struct Plan {
   runs: Vec<(usize, usize)>,
@@ -770,9 +817,24 @@ fn denoise(job: Job, reporter: &Reporter) -> Result<()> {
   } = format;
   // The scan runs once the checks above have passed, before any output exists. The second
   // ffmpeg waits meanwhile.
-  let plan = match job.min_grain {
-    Some(min_grain) => Some(plan(&job, min_grain, reporter)?),
-    None => None,
+  let plan = match (job.min_grain, &job.denoise_frames) {
+    (Some(min_grain), _) => Some(plan(&job, min_grain, reporter)?),
+    (None, Some(FrameRanges(runs))) => {
+      let plan = Plan {
+        runs: runs.clone(),
+        // Frames past the last range are copied.
+        frames: usize::MAX,
+      };
+      if reporter.text() {
+        eprintln!(
+          "Denoising {} frames in {} runs, and copying the rest",
+          plan.denoised_frames(),
+          plan.runs.len()
+        );
+      }
+      Some(plan)
+    }
+    (None, None) => None,
   };
   check_cancel()?;
 
@@ -1380,6 +1442,7 @@ fn run(command: Command, reporter: &Reporter) -> Result<()> {
       lambda,
       basic,
       min_grain,
+      denoise_frames,
       step,
       temporal_radius,
       search_radius,
@@ -1439,6 +1502,7 @@ fn run(command: Command, reporter: &Reporter) -> Result<()> {
           show_spectrum: show_spectrum.map(|b| b as usize),
           overwrite,
           min_grain,
+          denoise_frames,
         },
         reporter,
       )
@@ -1505,7 +1569,7 @@ mod tests {
     let command = cli_command();
     command.clone().debug_assert();
     let denoise = command.find_subcommand("denoise").unwrap();
-    let text = ["input", "output", "ffmpeg", "device", "progress"];
+    let text = ["input", "output", "ffmpeg", "device", "progress", "denoise_frames"];
     for arg in denoise.get_arguments() {
       let id = arg.get_id().as_str();
       let takes_value = arg.get_num_args().is_some_and(|n| n.takes_values());
@@ -1526,6 +1590,21 @@ mod tests {
     assert_eq!(plan.denoised_frames(), 4);
     let none = Plan { runs: vec![], frames: 4 };
     assert!(!(0..6).any(|i| none.denoises(i)));
+  }
+
+  #[test]
+  fn frame_ranges_are_sorted_and_joined() {
+    assert_eq!(
+      parse_frame_ranges("515-1265, 0-299,300-310,42,1266"),
+      Ok(FrameRanges(vec![(0, 310), (515, 1266)]))
+    );
+    assert_eq!(parse_frame_ranges("7"), Ok(FrameRanges(vec![(7, 7)])));
+    assert!(parse_frame_ranges("10-5").is_err());
+    assert!(parse_frame_ranges("a-5").is_err());
+    assert!(parse_frame_ranges("").is_err());
+    let parse = |args: &[&str]| cli_command().try_get_matches_from([&["rabbit-denoise", "denoise"], args].concat());
+    assert!(parse(&["--denoise-frames", "0-9"]).is_ok());
+    assert!(parse(&["--denoise-frames", "0-9", "--min-grain", "2"]).is_err());
   }
 
   #[test]

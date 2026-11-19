@@ -424,14 +424,14 @@ impl GrainTally {
     out
   }
 
-  /// The grain deviation of every band in 8 bit code values, or None where too few blocks
+  /// The grain deviation of every band on a 0 to 255 scale, or None where too few blocks
   /// were measured.
   pub fn bands(&self, maxval: f32) -> [Option<f32>; BANDS] {
     let to_8bit = 255.0 / maxval as f64;
     std::array::from_fn(|b| (self.blocks[b] >= MIN_BLOCKS as f64).then(|| ((self.weighted[b] / self.blocks[b]).sqrt() * to_8bit) as f32))
   }
 
-  /// The grain deviation in 8 bit code values over the bands with enough blocks, each
+  /// The grain deviation on a 0 to 255 scale over the bands with enough blocks, each
   /// weighted by its block count, or None when no band had enough.
   pub fn deviation(&self, maxval: f32) -> Option<f32> {
     let (mut sum, mut count) = (0.0f64, 0.0f64);

@@ -11,6 +11,10 @@ use crate::plane::Plane;
 use rayon::prelude::*;
 
 pub const BANDS: usize = 16;
+// How many blocks `measure` sums at once.
+const LANES: usize = 8;
+// How many candidates `pair_blocks` compares at once.
+const SEARCH_LANES: usize = 8;
 // Median of a chi-square variable with one degree of freedom.
 const MEDIAN_CHI2: f32 = 0.454_936_4;
 // The most a frequency's grain deviation may exceed the band's high frequency grain.
@@ -94,12 +98,36 @@ impl NoiseStats {
     let (means, energy): (Vec<f32>, Vec<f32>) = (0..bh)
       .into_par_iter()
       .flat_map_iter(|by| {
-        (0..bw).map(move |bx| {
+        let mut row = Vec::with_capacity(bw);
+        let mut bx = 0;
+        // LANES blocks side by side, each summed in its own order as the one at a time below,
+        // which vectorizes across the blocks.
+        while bx + LANES <= bw {
+          let patches: [[f32; AREA]; LANES] = std::array::from_fn(|k| load(bx + k, by));
+          let mut sums = [-0.0f32; LANES];
+          for i in 0..AREA {
+            for k in 0..LANES {
+              sums[k] += patches[k][i];
+            }
+          }
+          let means = sums.map(|s| s / AREA as f32);
+          let mut acs = [-0.0f32; LANES];
+          for i in 0..AREA {
+            for k in 0..LANES {
+              let d = patches[k][i] - means[k];
+              acs[k] += d * d;
+            }
+          }
+          row.extend((0..LANES).map(|k| (means[k], acs[k] / AREA as f32)));
+          bx += LANES;
+        }
+        row.extend((bx..bw).map(|bx| {
           let patch = load(bx, by);
           let mean = patch.iter().sum::<f32>() / AREA as f32;
           let ac = patch.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / AREA as f32;
           (mean, ac)
-        })
+        }));
+        row
       })
       .unzip();
 
@@ -269,8 +297,43 @@ impl NoiseStats {
           let (match_a, match_b) = matching.unwrap_or((basic_a, basic_b));
           let reference = load(match_a, x, y);
           let (mut best, mut at) = (f32::MAX, (x, y));
+          let (left, right) = (x.saturating_sub(PAIR_RADIUS), (x + PAIR_RADIUS).min(width - N));
           for my in y.saturating_sub(PAIR_RADIUS)..=(y + PAIR_RADIUS).min(height - N) {
-            for mx in x.saturating_sub(PAIR_RADIUS)..=(x + PAIR_RADIUS).min(width - N) {
+            if right + 1 - left >= SEARCH_LANES {
+              // SEARCH_LANES candidates side by side, each summed as one at a time below, then
+              // taken in order. A sum cut short could not have been the best either. The last
+              // group ends at the right edge and may repeat candidates, which then do not beat
+              // the best they already set.
+              let last = right + 1 - SEARCH_LANES;
+              let end = ((right + 1 - left) % SEARCH_LANES != 0).then_some(last);
+              for mx in (left..=last).step_by(SEARCH_LANES).chain(end) {
+                let mut sums = [0.0f32; SEARCH_LANES];
+                for row in 0..N {
+                  let line = match_b.row(mx, my + row, N + SEARCH_LANES - 1);
+                  let squares: [[f32; SEARCH_LANES]; N] = std::array::from_fn(|i| {
+                    std::array::from_fn(|k| {
+                      let d = reference[row * N + i] - line[k + i];
+                      d * d
+                    })
+                  });
+                  let s = &squares;
+                  for (k, sum) in sums.iter_mut().enumerate() {
+                    *sum += ((s[0][k] + s[4][k]) + (s[1][k] + s[5][k])) + ((s[2][k] + s[6][k]) + (s[3][k] + s[7][k]));
+                  }
+                  if sums.iter().all(|&sum| sum >= best) {
+                    break;
+                  }
+                }
+                for (k, &sum) in sums.iter().enumerate() {
+                  if sum < best {
+                    best = sum;
+                    at = (mx + k, my);
+                  }
+                }
+              }
+              continue;
+            }
+            for mx in left..=right {
               let mut sum = 0.0;
               for row in 0..N {
                 let candidate = match_b.row(mx, my + row, N);

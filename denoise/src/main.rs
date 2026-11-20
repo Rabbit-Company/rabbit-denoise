@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use rabbit_denoise::dct::Transforms;
 use rabbit_denoise::noise::{GrainTally, NoiseModel, NoiseStats};
-use rabbit_denoise::scenes::{CutDetector, blur};
+use rabbit_denoise::scenes::{CutDetector, blur_into};
 use rabbit_denoise::{Denoiser, Device, Frame, FrameModels, Measured, Plane, Settings};
 use rayon::prelude::*;
 use serde_json::{Value, json};
@@ -430,7 +430,13 @@ fn chroma_size(colorspace: Colorspace, width: usize, height: usize) -> Result<Op
 
 /// Converts a plane's samples on all threads, a row at a time.
 fn to_plane(bytes: &[u8], width: usize, height: usize, wide: bool) -> Plane {
-  let mut plane = Plane::new(width, height);
+  to_plane_into(bytes, width, height, wide, vec![0.0; width * height])
+}
+
+/// `to_plane`, written into `data`, a buffer to reuse.
+fn to_plane_into(bytes: &[u8], width: usize, height: usize, wide: bool, mut data: Vec<f32>) -> Plane {
+  data.resize(width * height, 0.0);
+  let mut plane = Plane { width, height, data };
   let rows = plane.data.par_chunks_mut(width.max(1));
   if wide {
     rows.zip(bytes.par_chunks(2 * width.max(1))).for_each(|(row, src)| {
@@ -690,6 +696,17 @@ impl Format {
     if let Some((cw, ch)) = self.chroma {
       planes.push(to_plane(frame.get_u_plane(), cw, ch, self.wide));
       planes.push(to_plane(frame.get_v_plane(), cw, ch, self.wide));
+    }
+    Frame { planes }
+  }
+
+  /// `frame`, in buffers taken from `buffers`.
+  fn frame_into(&self, frame: &y4m::Frame, buffers: &Buffers) -> Frame {
+    let plane = |bytes: &[u8], w: usize, h: usize| to_plane_into(bytes, w, h, self.wide, buffers.take(w * h));
+    let mut planes = vec![plane(frame.get_y_plane(), self.width, self.height)];
+    if let Some((cw, ch)) = self.chroma {
+      planes.push(plane(frame.get_u_plane(), cw, ch));
+      planes.push(plane(frame.get_v_plane(), cw, ch));
     }
     Frame { planes }
   }
@@ -1151,24 +1168,67 @@ impl Scene {
 /// per plane, and the luma grain between it and the frame before, for the second of a pair.
 type Measurement = (bool, Vec<NoiseStats>, Option<NoiseStats>);
 
+/// Plane buffers that `scan` reuses. Fresh memory for every frame cost a fifth of the time,
+/// in the system clearing its pages.
+#[derive(Default)]
+struct Buffers(std::sync::Mutex<Vec<Vec<f32>>>);
+
+impl Buffers {
+  /// The most buffers kept. No more are kept than were in use at once.
+  const KEPT: usize = 32;
+
+  /// A buffer of `len` samples if one is kept, or an empty one.
+  fn take(&self, len: usize) -> Vec<f32> {
+    let mut kept = self.0.lock().expect("buffers");
+    kept
+      .iter()
+      .position(|b| b.len() == len)
+      .map_or_else(Vec::new, |i| kept.swap_remove(i))
+  }
+
+  fn give(&self, data: Vec<f32>) {
+    let mut kept = self.0.lock().expect("buffers");
+    if kept.len() < Self::KEPT {
+      kept.push(data);
+    }
+  }
+
+  fn give_frame(&self, frame: Frame) {
+    frame.planes.into_iter().for_each(|p| self.give(p.data));
+  }
+}
+
 /// How many pairs `scan` goes on measuring while it waits for the oldest to finish.
 const PAIRS_AT_ONCE: usize = 2;
 
 /// Measures a frame and the next, or a frame without a pair, with its cut.
-fn measure_frames(first: (Frame, bool), second: Option<(Frame, bool)>, maxval: f32, transforms: &Transforms) -> Vec<Measurement> {
+fn measure_frames(
+  first: (Frame, bool),
+  second: Option<(Frame, bool)>,
+  maxval: f32,
+  transforms: &Transforms,
+  buffers: &Buffers,
+) -> Vec<Measurement> {
   let single = |frame: &Frame| -> Vec<NoiseStats> { frame.planes.iter().map(|p| NoiseStats::measure(p, maxval, transforms)).collect() };
   let Some(second) = second else {
-    return vec![(first.1, single(&first.0), None)];
+    let stats = single(&first.0);
+    buffers.give_frame(first.0);
+    return vec![(first.1, stats, None)];
   };
   let (a, b) = (&first.0.planes[0], &second.0.planes[0]);
   let ((stats_a, stats_b), pair) = rayon::join(
     || rayon::join(|| single(&first.0), || single(&second.0)),
     || {
-      let (blurred_a, blurred_b) = rayon::join(|| blur(a), || blur(b));
+      let take = |p: &Plane| buffers.take(p.data.len());
+      let (blurred_a, blurred_b) = rayon::join(|| blur_into(a, take(a)), || blur_into(b, take(b)));
       let blocks = NoiseStats::pair_blocks(a, &blurred_a, b, &blurred_b, None, transforms);
+      buffers.give(blurred_a.data);
+      buffers.give(blurred_b.data);
       NoiseStats::from_pairs(&blocks, false, maxval)
     },
   );
+  buffers.give_frame(first.0);
+  buffers.give_frame(second.0);
   vec![(first.1, stats_a, None), (second.1, stats_b, Some(pair))]
 }
 
@@ -1274,6 +1334,8 @@ fn scan(
     // One thread reads frames and finds the cuts while another measures the frame before, so
     // that reading, which is mostly on one thread, does not leave the others waiting.
     let (decoded_in, decoded) = std::sync::mpsc::sync_channel::<Result<(Frame, bool)>>(2);
+    let buffers = std::sync::Arc::new(Buffers::default());
+    let reading = buffers.clone();
     scope.spawn(move || {
       let mut cuts = CutDetector::new(format.maxval);
       for index in 0.. {
@@ -1285,7 +1347,7 @@ fn scan(
             return;
           }
         };
-        let frame = format.frame(&frame);
+        let frame = format.frame_into(&frame, &reading);
         let cut = cuts.is_cut(&frame.planes[0]);
         if decoded_in.send(Ok((frame, cut))).is_err() {
           return;
@@ -1302,9 +1364,9 @@ fn scan(
       let mut running = std::collections::VecDeque::new();
       let mut start = |first: (Frame, bool), second: Option<(Frame, bool)>| -> bool {
         let (done, measured) = std::sync::mpsc::sync_channel(1);
-        let transforms = transforms.clone();
+        let (transforms, buffers) = (transforms.clone(), buffers.clone());
         rayon::spawn(move || {
-          let _ = done.send(measure_frames(first, second, maxval, &transforms));
+          let _ = done.send(measure_frames(first, second, maxval, &transforms, &buffers));
         });
         running.push_back(measured);
         while running.len() > PAIRS_AT_ONCE {

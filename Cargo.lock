@@ -922,7 +922,7 @@ dependencies = [
 
 [[package]]
 name = "rabbit-denoise"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "anyhow",
  "bytemuck",

@@ -23,14 +23,18 @@ impl Plane {
     let (fx, fy) = (self.width.div_ceil(width), self.height.div_ceil(height));
     let mut out = Plane::new(width, height);
     out.data.par_chunks_mut(width).enumerate().for_each(|(y, row)| {
-      for (x, value) in row.iter_mut().enumerate() {
-        let (mut sum, mut count) = (0.0, 0.0);
-        for sy in y * fy..((y + 1) * fy).min(self.height) {
-          for sx in x * fx..((x + 1) * fx).min(self.width) {
-            sum += self.at(sx, sy);
-            count += 1.0;
+      // Each value adds its samples row by row and left to right, a source row at a time.
+      let mut sums = vec![(0.0f32, 0.0f32); width];
+      for sy in y * fy..((y + 1) * fy).min(self.height) {
+        let src = self.row(0, sy, self.width);
+        for (x, (sum, count)) in sums.iter_mut().enumerate() {
+          for &v in src.get(x * fx..((x + 1) * fx).min(self.width)).unwrap_or(&[]) {
+            *sum += v;
+            *count += 1.0;
           }
         }
+      }
+      for (value, (sum, count)) in row.iter_mut().zip(sums) {
         *value = if count > 0.0 { sum / count } else { 0.0 };
       }
     });

@@ -50,24 +50,42 @@ impl CutDetector {
 /// A 3x3 box blur, which cuts white grain to a third of its deviation and keeps most of the
 /// picture, so that blocks can be matched between frames on the picture.
 pub fn blur(plane: &Plane) -> Plane {
+  blur_into(plane, Vec::new())
+}
+
+/// Rows of `blur` made on one thread at a time.
+const BLUR_ROWS: usize = 8;
+
+/// `blur`, written into `data`, a buffer to reuse.
+pub fn blur_into(plane: &Plane, mut data: Vec<f32>) -> Plane {
   let (w, h) = (plane.width, plane.height);
-  let mut rows = Plane::new(w, h);
-  rows.data.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
-    let src = plane.row(0, y, w);
-    for x in 0..w {
-      let (l, r) = (x.saturating_sub(1), (x + 1).min(w - 1));
-      row[x] = (src[l] + src[x] + src[r]) / 3.0;
+  data.resize(w * h, 0.0);
+  let mut out = Plane { width: w, height: h, data };
+  out.data.par_chunks_mut(w * BLUR_ROWS).enumerate().for_each(|(band, rows)| {
+    // The rows blurred across, for this band's rows and the one on each side.
+    let y0 = band * BLUR_ROWS;
+    let (first, last) = (y0.saturating_sub(1), (y0 + rows.len() / w).min(h - 1));
+    let mut across = vec![0.0f32; (last + 1 - first) * w];
+    for (y, row) in (first..=last).zip(across.chunks_mut(w)) {
+      let src = plane.row(0, y, w);
+      // The edges repeat their sample. The rest runs without the clamps, which vectorizes.
+      let at = |x: usize| (src[x.saturating_sub(1)] + src[x] + src[(x + 1).min(w - 1)]) / 3.0;
+      row[0] = at(0);
+      if w > 1 {
+        row[w - 1] = at(w - 1);
+      }
+      if w > 2 {
+        for ((out, s), (l, r)) in row[1..w - 1].iter_mut().zip(&src[1..w - 1]).zip(src[..w - 2].iter().zip(&src[2..])) {
+          *out = (l + s + r) / 3.0;
+        }
+      }
     }
-  });
-  let mut out = Plane::new(w, h);
-  out.data.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
-    let (up, here, down) = (
-      rows.row(0, y.saturating_sub(1), w),
-      rows.row(0, y, w),
-      rows.row(0, (y + 1).min(h - 1), w),
-    );
-    for x in 0..w {
-      row[x] = (up[x] + here[x] + down[x]) / 3.0;
+    let at = |y: usize| &across[(y - first) * w..(y - first + 1) * w];
+    for (y, row) in (y0..).zip(rows.chunks_mut(w)) {
+      let (up, here, down) = (at(y.saturating_sub(1)), at(y), at((y + 1).min(h - 1)));
+      for (out, ((u, c), d)) in row.iter_mut().zip(up.iter().zip(here).zip(down)) {
+        *out = (u + c + d) / 3.0;
+      }
     }
   });
   out

@@ -4,6 +4,7 @@ use rabbit_denoise::dct::Transforms;
 use rabbit_denoise::noise::{GrainTally, NoiseModel, NoiseStats};
 use rabbit_denoise::scenes::{CutDetector, blur};
 use rabbit_denoise::{Denoiser, Device, Frame, FrameModels, Measured, Plane, Settings};
+use rayon::prelude::*;
 use serde_json::{Value, json};
 use std::fmt::{self, Display};
 use std::io::{BufReader, BufWriter, Read, Write};
@@ -427,13 +428,24 @@ fn chroma_size(colorspace: Colorspace, width: usize, height: usize) -> Result<Op
   })
 }
 
+/// Converts a plane's samples on all threads, a row at a time.
 fn to_plane(bytes: &[u8], width: usize, height: usize, wide: bool) -> Plane {
-  let data = if wide {
-    bytes.as_chunks::<2>().0.iter().map(|b| u16::from_le_bytes(*b) as f32).collect()
+  let mut plane = Plane::new(width, height);
+  let rows = plane.data.par_chunks_mut(width.max(1));
+  if wide {
+    rows.zip(bytes.par_chunks(2 * width.max(1))).for_each(|(row, src)| {
+      for (v, b) in row.iter_mut().zip(src.as_chunks::<2>().0) {
+        *v = u16::from_le_bytes(*b) as f32;
+      }
+    });
   } else {
-    bytes.iter().map(|&b| b as f32).collect()
-  };
-  Plane { width, height, data }
+    rows.zip(bytes.par_chunks(width.max(1))).for_each(|(row, src)| {
+      for (v, &b) in row.iter_mut().zip(src) {
+        *v = b as f32;
+      }
+    });
+  }
+  plane
 }
 
 fn to_bytes(plane: &Plane, maxval: f32, wide: bool) -> Vec<u8> {
@@ -1135,6 +1147,31 @@ impl Scene {
   }
 }
 
+/// A frame's measurements for `scan`: whether it starts a scene, its grain on single frames
+/// per plane, and the luma grain between it and the frame before, for the second of a pair.
+type Measurement = (bool, Vec<NoiseStats>, Option<NoiseStats>);
+
+/// How many pairs `scan` goes on measuring while it waits for the oldest to finish.
+const PAIRS_AT_ONCE: usize = 2;
+
+/// Measures a frame and the next, or a frame without a pair, with its cut.
+fn measure_frames(first: (Frame, bool), second: Option<(Frame, bool)>, maxval: f32, transforms: &Transforms) -> Vec<Measurement> {
+  let single = |frame: &Frame| -> Vec<NoiseStats> { frame.planes.iter().map(|p| NoiseStats::measure(p, maxval, transforms)).collect() };
+  let Some(second) = second else {
+    return vec![(first.1, single(&first.0), None)];
+  };
+  let (a, b) = (&first.0.planes[0], &second.0.planes[0]);
+  let ((stats_a, stats_b), pair) = rayon::join(
+    || rayon::join(|| single(&first.0), || single(&second.0)),
+    || {
+      let (blurred_a, blurred_b) = rayon::join(|| blur(a), || blur(b));
+      let blocks = NoiseStats::pair_blocks(a, &blurred_a, b, &blurred_b, None, transforms);
+      NoiseStats::from_pairs(&blocks, false, maxval)
+    },
+  );
+  vec![(first.1, stats_a, None), (second.1, stats_b, Some(pair))]
+}
+
 /// Rounds for printing in JSON, where f32 values would show their binary noise.
 fn rounded(value: f64, places: i32) -> f64 {
   let scale = 10f64.powi(places);
@@ -1234,53 +1271,94 @@ fn scan(
 
   let mut read = 0usize;
   let stopped = std::thread::scope(|scope| -> Result<bool> {
-    // The reader decodes and measures, as measuring a frame does not need the one before.
-    let (frames_in, frames) = std::sync::mpsc::sync_channel::<Result<(bool, Vec<NoiseStats>, Option<NoiseStats>)>>(4);
+    // One thread reads frames and finds the cuts while another measures the frame before, so
+    // that reading, which is mostly on one thread, does not leave the others waiting.
+    let (decoded_in, decoded) = std::sync::mpsc::sync_channel::<Result<(Frame, bool)>>(2);
     scope.spawn(move || {
-      let transforms = Transforms::new(1);
       let mut cuts = CutDetector::new(format.maxval);
-      // The first frame of a pair: its luma, and blurred to match blocks on.
-      let mut previous: Option<(Plane, Plane)> = None;
       for index in 0.. {
         let frame = match decoder.read_frame() {
           Ok(frame) => frame,
           Err(y4m::Error::EOF) => return,
           Err(e) => {
-            let _ = frames_in.send(Err(fail("bad_input", format!("could not read frame {index}: {e:?}"))));
+            let _ = decoded_in.send(Err(fail("bad_input", format!("could not read frame {index}: {e:?}"))));
             return;
           }
         };
         let frame = format.frame(&frame);
         let cut = cuts.is_cut(&frame.planes[0]);
-        // Grain is measured between frames 0 and 1, 2 and 3, and so on, which is enough and
-        // takes half the time of every pair. A pair across a cut measures nothing useful.
-        let (stats, pair) = rayon::join(
-          || -> Vec<NoiseStats> {
-            frame
-              .planes
-              .iter()
-              .map(|p| NoiseStats::measure(p, format.maxval, &transforms))
-              .collect()
-          },
-          || {
-            let blurred = blur(&frame.planes[0]);
-            match previous.take() {
-              Some((luma_a, blurred_a)) if !cut => {
-                let blocks = NoiseStats::pair_blocks(&luma_a, &blurred_a, &frame.planes[0], &blurred, None, &transforms);
-                (Some(NoiseStats::from_pairs(&blocks, false, format.maxval)), None)
-              }
-              _ => (None, Some(blurred)),
-            }
-          },
-        );
-        let (pair, blurred) = pair;
-        // The first frame of the next pair keeps its luma and blur.
-        if let Some(blurred) = blurred {
-          previous = Some((frame.planes.into_iter().next().expect("luma"), blurred));
-        }
-        if frames_in.send(Ok((cut, stats, pair))).is_err() {
+        if decoded_in.send(Ok((frame, cut))).is_err() {
           return;
         }
+      }
+    });
+    // Measuring a frame does not need the one before, except for the pairs.
+    let (frames_in, frames) = std::sync::mpsc::sync_channel::<Result<Measurement>>(4);
+    scope.spawn(move || {
+      let transforms = std::sync::Arc::new(Transforms::new(1));
+      let maxval = format.maxval;
+      // A pair is measured on all threads, and while one waits on a few of its last blocks
+      // the next keeps the others busy. They are passed on in order.
+      let mut running = std::collections::VecDeque::new();
+      let mut start = |first: (Frame, bool), second: Option<(Frame, bool)>| -> bool {
+        let (done, measured) = std::sync::mpsc::sync_channel(1);
+        let transforms = transforms.clone();
+        rayon::spawn(move || {
+          let _ = done.send(measure_frames(first, second, maxval, &transforms));
+        });
+        running.push_back(measured);
+        while running.len() > PAIRS_AT_ONCE {
+          let measured = running.pop_front().expect("running").recv().expect("measured");
+          for frame in measured {
+            if frames_in.send(Ok(frame)).is_err() {
+              return false;
+            }
+          }
+        }
+        true
+      };
+      // Grain is measured between frames 0 and 1, 2 and 3, and so on, which is enough and
+      // takes half the time of every pair. A pair across a cut measures nothing useful, so
+      // a cut starts the next pair.
+      let mut held: Option<(Frame, bool)> = None;
+      let mut failed = None;
+      for decoded in decoded {
+        let (frame, cut) = match decoded {
+          Ok(decoded) => decoded,
+          Err(e) => {
+            failed = Some(e);
+            break;
+          }
+        };
+        let going = match held.take() {
+          Some(first) if !cut => start(first, Some((frame, cut))),
+          Some(first) => {
+            held = Some((frame, cut));
+            start(first, None)
+          }
+          None => {
+            held = Some((frame, cut));
+            true
+          }
+        };
+        if !going {
+          return;
+        }
+      }
+      if let Some(first) = held
+        && !start(first, None)
+      {
+        return;
+      }
+      for measured in running {
+        for frame in measured.recv().expect("measured") {
+          if frames_in.send(Ok(frame)).is_err() {
+            return;
+          }
+        }
+      }
+      if let Some(e) = failed {
+        let _ = frames_in.send(Err(e));
       }
     });
     let mut current: Option<Scene> = None;

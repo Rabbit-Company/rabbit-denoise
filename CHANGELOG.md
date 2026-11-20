@@ -2,6 +2,12 @@
 
 Error codes and JSON field names stay compatible within a major version. Messages meant for people may change in any release. Before 1.0, a minor version may change the defaults and the options.
 
+## 0.1.10 - 2026-11-20
+
+### Changes
+
+- `analyze`, and the first read of `denoise --min-grain`, are 1.6 to 2 times as fast, with the same results.
+
 ## 0.1.9 - 2026-11-19
 
 ### Features

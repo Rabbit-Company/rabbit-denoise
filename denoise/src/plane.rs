@@ -1,5 +1,7 @@
 //! Pictures as floating point planes, in the source's own code values.
 
+use rayon::prelude::*;
+
 #[derive(Clone)]
 pub struct Plane {
   pub width: usize,
@@ -16,12 +18,12 @@ impl Plane {
     }
   }
 
-  /// This plane averaged down to `width` x `height`.
+  /// This plane averaged down to `width` x `height`, a row of the result on each thread.
   pub fn downscale(&self, width: usize, height: usize) -> Plane {
     let (fx, fy) = (self.width.div_ceil(width), self.height.div_ceil(height));
     let mut out = Plane::new(width, height);
-    for y in 0..height {
-      for x in 0..width {
+    out.data.par_chunks_mut(width).enumerate().for_each(|(y, row)| {
+      for (x, value) in row.iter_mut().enumerate() {
         let (mut sum, mut count) = (0.0, 0.0);
         for sy in y * fy..((y + 1) * fy).min(self.height) {
           for sx in x * fx..((x + 1) * fx).min(self.width) {
@@ -29,9 +31,9 @@ impl Plane {
             count += 1.0;
           }
         }
-        out.data[y * width + x] = if count > 0.0 { sum / count } else { 0.0 };
+        *value = if count > 0.0 { sum / count } else { 0.0 };
       }
-    }
+    });
     out
   }
 
